@@ -287,6 +287,24 @@ Every build also logs *why* it rebuilt (`no cache yet`, `video latent changed`,
 line on **every** step, the cache is never being reused and the pass is running slower
 than stock -- the reason field says what is invalidating it.
 
+**Measured vs estimated memory:** every build logs what it predicted against what it
+actually cost:
+
+```
+cache built | estimated 9.7 GB | process RSS 21.3 GB -> 31.4 GB (+10.1 GB) | MemAvailable 18.2 GB -> 7.6 GB (-10.6 GB)
+```
+
+The pre-allocation estimate comes from `MemAvailable`, which is a kernel *guess* at what
+could be reclaimed under pressure, not a measurement -- it counts reclaimable page cache
+and slab, so it reads optimistically. `process RSS` is what the cache really cost. If
+those two disagree badly on your machine, trust RSS.
+
+Note that on the `ram` backend the memory is **pinned**, and PyTorch keeps freed pinned
+blocks in its caching host allocator rather than returning them to the OS. So RSS stays
+elevated after the cache is freed. That memory is reused by the next build, but the OS
+does not get it back for the life of the process -- the free log says so explicitly when
+it happens.
+
 **Lifecycle:** the cache persists across queue runs on purpose (re-queueing the same
 refine skips the rebuild) and is invalidated automatically by a new video latent (new
 seed), a layout change, or eviction (2 slots max). Disk caches live under the ComfyUI

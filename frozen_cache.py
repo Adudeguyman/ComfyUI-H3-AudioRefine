@@ -137,6 +137,23 @@ CODECS = {"bf16": _CodecBF16(), "fp8": _CodecFP8(), "int4": _CodecINT4()}
 # ---------------------------------------------------------------------------
 # storage backends
 
+def _rss_bytes():
+    """Resident set size of this process -- what the cache actually cost, as opposed to
+    what MemAvailable predicted it would."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _gb(n):
+    return "n/a" if n is None else "%.1f GB" % (n / 2**30)
+
+
 def _meminfo_available_bytes():
     try:
         with open("/proc/meminfo") as f:
@@ -392,7 +409,20 @@ class _Slot:
 
     def free(self):
         if self.store is not None:
+            backend = getattr(self.store, "name", "?")
+            rss0 = _rss_bytes()
             self.store.free()
+            self.dq_k = self.dq_v = self.dq_h = None
+            rss1 = _rss_bytes()
+            if rss0 is not None and rss1 is not None:
+                returned = rss0 - rss1
+                note = ""
+                if backend == "ram" and returned < 0.5 * (rss0 - rss1 + 1):
+                    note = (" -- pinned host memory is held by PyTorch's caching host "
+                            "allocator and is not returned to the OS; it is reused by the "
+                            "next build rather than released")
+                log.info("H3 Frozen Video Cache: cache freed (%s) | process RSS %s -> %s "
+                         "(returned %s)%s", backend, _gb(rss0), _gb(rss1), _gb(max(returned, 0)), note)
         self.store = None
         self.dq_k = self.dq_v = self.dq_h = None
 
@@ -413,6 +443,9 @@ class _State:
         self.aa = self.ab = 0
         self.step_ctx = {}
         self.warned = set()
+        self.rss_before = None
+        self.avail_before = None
+        self.est_bytes = 0
         self.n_cached = 0     # blocks that took the cached path this call
         self.n_built = 0      # blocks that took the (full) build path this call
         self.n_stock = 0      # blocks that fell through to the stock path this call
@@ -735,6 +768,9 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                                 "build. Repeated runs cause real SSD wear -- see the disk wear "
                                 "note in the README.", total / 2**30)
                 slot.codec = codec
+                state.rss_before = _rss_bytes()
+                state.avail_before = _meminfo_available_bytes()
+                state.est_bytes = total
                 slot.store = STORES[backend](n_blocks, codec, seq_len, d_store, x[0].device, pair=pair)
                 slot.seq_len = seq_len
                 slot.store_d = d_store
@@ -761,6 +797,14 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                 slot.layout_sig = sig
                 slot.video_fp = video_fp
                 slot.context_fp = context_fp
+                rss_after = _rss_bytes()
+                avail_after = _meminfo_available_bytes()
+                d_rss = None if (rss_after is None or state.rss_before is None) else rss_after - state.rss_before
+                d_av = None if (avail_after is None or state.avail_before is None) else state.avail_before - avail_after
+                log.info("H3 Frozen Video Cache: cache built | estimated %s | process RSS %s -> %s "
+                         "(+%s) | MemAvailable %s -> %s (-%s)",
+                         _gb(state.est_bytes), _gb(state.rss_before), _gb(rss_after), _gb(d_rss),
+                         _gb(state.avail_before), _gb(avail_after), _gb(d_av))
             if state.verbose:
                 _sync_if_cuda(x[0])
                 total = time.perf_counter() - t_call
