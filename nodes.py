@@ -216,13 +216,19 @@ class H3FrozenVideoCache:
                     "tooltip": "Rebuild the cache every N refinement steps (each rebuild costs one "
                                "full-price step) so the frozen rows periodically see the current "
                                "audio. 0 = build once, never refresh."}),
+                "verbose": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Log per-step diagnostics to the console: how many blocks took the "
+                               "cached / build / stock path, time spent inside the patched blocks, "
+                               "and time spent in the rest of the model call. Use this to find out "
+                               "where a refinement step is actually spending its time."}),
             },
         }
 
-    def patch(self, model, cache_contents, backend, precision, refresh_interval):
+    def patch(self, model, cache_contents, backend, precision, refresh_interval, verbose=False):
         from . import frozen_cache
         return (frozen_cache.patch_model(model, backend, precision, refresh_interval,
-                                         cache_contents=cache_contents),)
+                                         cache_contents=cache_contents, verbose=verbose),)
 
 
 NODE_CLASS_MAPPINGS = {

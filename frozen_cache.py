@@ -26,6 +26,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import weakref
 
 import numpy as np
@@ -396,7 +397,8 @@ class _Slot:
 
 
 class _State:
-    def __init__(self, backend, precision, refresh_interval, contents="kv"):
+    def __init__(self, backend, precision, refresh_interval, contents="kv", verbose=False):
+        self.verbose = verbose
         self.backend = backend
         self.precision = precision
         self.refresh_interval = refresh_interval
@@ -408,6 +410,10 @@ class _State:
         self.aa = self.ab = 0
         self.step_ctx = {}
         self.warned = set()
+        self.n_cached = 0     # blocks that took the cached path this call
+        self.n_built = 0      # blocks that took the (full) build path this call
+        self.n_stock = 0      # blocks that fell through to the stock path this call
+        self.t_blocks = 0.0   # wall time spent inside patched blocks this call
 
     def warn_once(self, tag, msg):
         if tag not in self.warned:
@@ -571,6 +577,12 @@ def _block_cached(state, blk, args):
     return {"img": x}
 
 
+def _sync_if_cuda(t):
+    """CUDA is async; without a sync the block timings are meaningless."""
+    if t.device.type == "cuda":
+        torch.cuda.synchronize(t.device)
+
+
 def _find_audio_mod_row(mod_segments, aa, ab):
     for a, b, row in mod_segments:
         if a == aa and b == ab and isinstance(row, int):
@@ -581,6 +593,7 @@ def _find_audio_mod_row(mod_segments, aa, ab):
 def make_block_replace(state, get_block, n_blocks):
     def block_replace(args, extra):
         if state.mode == "off":
+            state.n_stock += 1
             return extra["original_block"](args)
         i = state.step_ctx.get("block_index", 0)
         if i == 0:
@@ -608,9 +621,20 @@ def make_block_replace(state, get_block, n_blocks):
                     state.slot.dq_v = torch.empty_like(state.slot.dq_k)
                 state.slot.store.begin_step(range(n_blocks))
         blk = get_block(i)
-        if state.mode == "build":
-            return _block_build(state, blk, args)
-        return _block_cached(state, blk, args)
+        if not state.verbose:
+            if state.mode == "build":
+                return _block_build(state, blk, args)
+            return _block_cached(state, blk, args)
+        t0 = time.perf_counter()
+        try:
+            if state.mode == "build":
+                state.n_built += 1
+                return _block_build(state, blk, args)
+            state.n_cached += 1
+            return _block_cached(state, blk, args)
+        finally:
+            _sync_if_cuda(args["img"])
+            state.t_blocks += time.perf_counter() - t0
 
     return block_replace
 
@@ -619,6 +643,9 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
     def wrapper(executor, x, timestep, context, transformer_options={}, **kwargs):
         state.mode = "off"
         state.step_ctx = {}
+        state.n_cached = state.n_built = state.n_stock = 0
+        state.t_blocks = 0.0
+        t_call = time.perf_counter()
         try:
             payload = kwargs.get("minimax_payload") or {}
             layout = payload.get("layout")
@@ -696,6 +723,20 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                 # stamp validity only after the build completed every block
                 slot.layout_sig = sig
                 slot.video_fp = video_fp
+            if state.verbose:
+                _sync_if_cuda(x[0])
+                total = time.perf_counter() - t_call
+                if state.n_cached + state.n_built + state.n_stock == 0:
+                    log.warning("H3 Frozen Video Cache: the block replacement never ran this "
+                                "call (0 of %d blocks) -- this build of ComfyUI is not "
+                                "dispatching patches_replace['dit'][('double_block', i)], so "
+                                "the cache cannot take effect. Model call took %.2fs.",
+                                n_blocks, total)
+                log.info("H3 Frozen Video Cache: %s step | blocks: %d cached, %d built, "
+                         "%d stock (of %d) | block loop %.2fs | whole model call %.2fs | "
+                         "outside blocks %.2fs",
+                         state.mode, state.n_cached, state.n_built, state.n_stock, n_blocks,
+                         state.t_blocks, total, total - state.t_blocks)
             return ret
         finally:
             state.mode = "off"
@@ -730,7 +771,7 @@ def check_core_compat(dm):
             "node needs an update. Bypass the node to keep working." % "; ".join(problems))
 
 
-def patch_model(model, backend, precision, refresh_interval, cache_contents="kv"):
+def patch_model(model, backend, precision, refresh_interval, cache_contents="kv", verbose=False):
     if precision == "fp8" and _FP8 is None:
         raise RuntimeError("H3 Frozen Video Cache: this PyTorch build has no float8_e4m3fn; "
                            "use bf16 or int4 precision instead.")
@@ -743,7 +784,7 @@ def patch_model(model, backend, precision, refresh_interval, cache_contents="kv"
         d_hidden = dm.blocks[0].norm1.weight.shape[0]
 
     m = model.clone()
-    state = _State(backend, precision, refresh_interval, cache_contents)
+    state = _State(backend, precision, refresh_interval, cache_contents, verbose=verbose)
     replace = make_block_replace(state, lambda i: dm.blocks[i], n_blocks)
     for i in range(n_blocks):
         m.set_model_patch_replace(replace, "dit", "double_block", i)

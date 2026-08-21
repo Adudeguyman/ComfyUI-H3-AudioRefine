@@ -166,6 +166,19 @@ deviation on the test model, both contents modes: bf16 ~0, fp8 ~4e-4 relative, i
 quantization error through the rebuilt projection (measured 0.0022 vs 0.0020 for `kv`
 at int4).
 
+**Diagnosing a refinement pass** (`verbose` input): logs one line per model call:
+
+```
+cached step | blocks: 50 cached, 0 built, 0 stock (of 50) | block loop 2.1s | whole model call 15.4s | outside blocks 13.3s
+```
+
+Read it as follows. `0 of 50` blocks touched (plus a warning) means the block replacement
+never ran and the cache cannot take effect at all. A high `block loop` time with 50 blocks
+cached means the transformer is still the bottleneck and the cache is not saving what it
+should. A small `block loop` next to a large `outside blocks` means the step's time is
+being spent outside the transformer entirely -- patchify, text refiner, final layer, or
+memory management -- in which case no amount of caching inside the blocks will help.
+
 **Lifecycle:** the cache persists across queue runs on purpose (re-queueing the same
 refine skips the rebuild) and is invalidated automatically by a new video latent (new
 seed), a layout change, or eviction (2 slots max). Disk caches live under the ComfyUI
