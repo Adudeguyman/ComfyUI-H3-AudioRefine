@@ -623,12 +623,15 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
             payload = kwargs.get("minimax_payload") or {}
             layout = payload.get("layout")
             denoise_mask = kwargs.get("denoise_mask")
+            audio_mask = kwargs.get("audio_denoise_mask")
             activate = (
                 layout is not None
                 and denoise_mask is not None
-                and kwargs.get("audio_denoise_mask") is None
                 and isinstance(x, (list, tuple)) and len(x) == 2
                 and float(denoise_mask.max()) < 1e-3
+                # audio must actually be generating; if it is also frozen there is
+                # nothing to refine and the stock path is the honest answer
+                and (audio_mask is None or float(audio_mask.max()) > 1e-3)
             )
             if activate:
                 seg = {s[2]: (s[0], s[1]) for s in layout.segments}
