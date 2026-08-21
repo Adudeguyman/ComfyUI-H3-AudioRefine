@@ -8,6 +8,10 @@ is Turbo-LoRA workflows where 4-step video is acceptable but 4-step audio is
 not: pay for a few extra audio steps instead of raising the whole joint pass
 to 8-20 steps.
 
+For how the cache actually works internally -- the packed layout, the ComfyUI hooks, the
+approximation, the cost model, and notes for modifying it -- see
+[TECHNICAL.md](TECHNICAL.md).
+
 ## How it works
 
 ComfyUI's native MiniMax H3 support already contains a masked-inpaint path for
