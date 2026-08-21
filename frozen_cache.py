@@ -382,6 +382,7 @@ class _Slot:
         self.codec = None
         self.layout_sig = None
         self.video_fp = None
+        self.context_fp = None
         self.last_sigma = None
         self.steps_since_build = 0
         self.dq_k = None
@@ -435,8 +436,11 @@ class _State:
         return slot
 
 
-def _video_fingerprint(video_x):
-    v = video_x.detach().float()
+def _tensor_fingerprint(t):
+    """Cheap content fingerprint. Used instead of data_ptr(): core reallocates conds
+    every model call (samplers.cond_cat -> torch.cat), so pointer identity is unstable
+    and keying on it forces a rebuild on every single step."""
+    v = t.detach().float()
     return (float(v.sum()), float(v.abs().sum()))
 
 
@@ -669,20 +673,29 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
 
             state.aa, state.ab = seg["audio"]
             sig = getattr(layout, "signature", None)
-            key = (sig, tuple(context.shape), context.data_ptr())
+            # NB: no data_ptr() here -- core allocates a fresh context tensor per call.
+            key = (sig, tuple(context.shape))
             slot = state.get_slot(key)
-            video_fp = _video_fingerprint(x[0])
+            video_fp = _tensor_fingerprint(x[0])
+            context_fp = _tensor_fingerprint(context)
             sigma = float(timestep.flatten()[0])
 
             new_step = slot.last_sigma is None or abs(sigma - slot.last_sigma) > 1e-9
             slot.last_sigma = sigma
 
-            need_build = (
-                slot.store is None
-                or slot.layout_sig != sig
-                or not _fp_matches(slot.video_fp, video_fp)
-                or (state.refresh_interval > 0 and slot.steps_since_build >= state.refresh_interval)
-            )
+            if slot.store is None:
+                reason = "no cache yet"
+            elif slot.layout_sig != sig:
+                reason = "layout changed"
+            elif not _fp_matches(slot.video_fp, video_fp):
+                reason = "video latent changed (new seed or new pass-1 result)"
+            elif not _fp_matches(slot.context_fp, context_fp):
+                reason = "conditioning changed"
+            elif state.refresh_interval > 0 and slot.steps_since_build >= state.refresh_interval:
+                reason = "refresh_interval reached"
+            else:
+                reason = None
+            need_build = reason is not None
             seq_len = layout.seq_len
 
             if need_build:
@@ -693,9 +706,9 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                 d_store = d_kv if pair else d_hidden
                 total = codec.nbytes(seq_len, d_store) * (2 if pair else 1) * n_blocks
                 backend, why = _resolve_backend(state.backend, total, x[0].device)
-                log.info("H3 Frozen Video Cache: building cache | rows=%d contents=%s dim=%d "
-                         "blocks=%d precision=%s size=%.1f GB backend=%s (%s)",
-                         seq_len, state.contents, d_store, n_blocks, state.precision,
+                log.info("H3 Frozen Video Cache: building cache (%s) | rows=%d contents=%s "
+                         "dim=%d blocks=%d precision=%s size=%.1f GB backend=%s (%s)",
+                         reason, seq_len, state.contents, d_store, n_blocks, state.precision,
                          total / 2**30, backend, why)
                 slot.codec = codec
                 slot.store = STORES[backend](n_blocks, codec, seq_len, d_store, x[0].device, pair=pair)
@@ -723,6 +736,7 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                 # stamp validity only after the build completed every block
                 slot.layout_sig = sig
                 slot.video_fp = video_fp
+                slot.context_fp = context_fp
             if state.verbose:
                 _sync_if_cuda(x[0])
                 total = time.perf_counter() - t_call

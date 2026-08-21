@@ -179,6 +179,11 @@ should. A small `block loop` next to a large `outside blocks` means the step's t
 being spent outside the transformer entirely -- patchify, text refiner, final layer, or
 memory management -- in which case no amount of caching inside the blocks will help.
 
+Every build also logs *why* it rebuilt (`no cache yet`, `video latent changed`,
+`conditioning changed`, `layout changed`, `refresh_interval reached`). If you see a build
+line on **every** step, the cache is never being reused and the pass is running slower
+than stock -- the reason field says what is invalidating it.
+
 **Lifecycle:** the cache persists across queue runs on purpose (re-queueing the same
 refine skips the rebuild) and is invalidated automatically by a new video latent (new
 seed), a layout change, or eviction (2 slots max). Disk caches live under the ComfyUI
