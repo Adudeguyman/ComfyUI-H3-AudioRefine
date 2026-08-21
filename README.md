@@ -53,6 +53,15 @@ The refinement average includes the one full-price cache build, so the steps aft
 considerably cheaper than 7.6s -- that is where the `verbose` per-step log is worth
 reading.
 
+**These numbers are from one machine and are not a promise.** They were measured on an
+RTX 5090 (32 GB) with the cache in system RAM at `hidden`/`int4`, on one clip at one
+resolution. Both the absolute times and the ratio between them will move with your GPU,
+your resolution and frame count, where the cache ends up living (VRAM, RAM, or disk), and
+whether the model itself fits in VRAM or is being streamed. On a card where weight
+streaming dominates the step, the saving will be much smaller than this table suggests --
+the cache only removes compute, and it cannot help with time that is not being spent on
+compute. Measure your own with `verbose` rather than working from these.
+
 ## Do I want the frozen cache?
 
 Both paths produce the same kind of result. They differ in what they spend.
@@ -67,8 +76,8 @@ steps costs roughly what six more generation steps would.
 
 **With the cache**, the frozen rows' per-block state is computed once and reused, so later
 steps only compute the audio rows. Refinement steps get substantially cheaper, at three
-costs: a chunk of RAM/VRAM/disk to hold the cache (7-8 GB at `hidden`/`int4` on a typical
-clip, more at `kv` or lower compression), a first refinement step at full price to build
+costs: a chunk of RAM/VRAM/disk to hold the cache (7-8 GB at `hidden`/`int4` for the clip above, more
+at `kv` or lower compression, and it scales with resolution and frame count), a first refinement step at full price to build
 it, and a mild approximation -- the frozen rows stop reacting to the evolving audio
 between rebuilds (see `refresh_interval`).
 
