@@ -23,8 +23,10 @@ is checked at patch time and per call, with loud fallback to the stock path.
 
 import logging
 import os
+import shutil
 import tempfile
 import threading
+import weakref
 
 import numpy as np
 import torch
@@ -148,7 +150,7 @@ def _meminfo_available_bytes():
 class _StoreVRAM:
     name = "vram"
 
-    def __init__(self, n_blocks, codec, s, d, device):
+    def __init__(self, n_blocks, codec, s, d, device, pair=True):
         self.k = [None] * n_blocks
         self.v = [None] * n_blocks
 
@@ -157,7 +159,8 @@ class _StoreVRAM:
         self.v[i] = (v_q, v_s)
 
     def get(self, i, device):
-        return self.k[i] + self.v[i]
+        v = self.v[i] if self.v[i] is not None else (None, None)
+        return self.k[i] + v
 
     def begin_step(self, order):
         pass
@@ -172,23 +175,36 @@ class _StoreVRAM:
 class _StoreRAM:
     name = "ram"
 
-    def __init__(self, n_blocks, codec, s, d, device):
+    def __init__(self, n_blocks, codec, s, d, device, pair=True):
         self.k = [None] * n_blocks
         self.v = [None] * n_blocks
 
-    @staticmethod
-    def _pin(t):
-        c = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=torch.cuda.is_available())
+    _pin_failed = False
+
+    @classmethod
+    def _pin(cls, t):
+        if t is None:
+            return None
+        pin = torch.cuda.is_available() and not cls._pin_failed
+        try:
+            c = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=pin)
+        except RuntimeError:
+            if not cls._pin_failed:
+                cls._pin_failed = True
+                log.warning("H3 Frozen Video Cache: could not pin cache memory (RAM pressure); "
+                            "falling back to pageable memory. Cached steps will be slightly "
+                            "slower but the cache can be swapped instead of killing the process.")
+            c = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=False)
         c.copy_(t)
         return c
 
     def put(self, i, k_q, k_s, v_q, v_s):
-        self.k[i] = (self._pin(k_q), self._pin(k_s) if k_s is not None else None)
-        self.v[i] = (self._pin(v_q), self._pin(v_s) if v_s is not None else None)
+        self.k[i] = (self._pin(k_q), self._pin(k_s))
+        self.v[i] = (self._pin(v_q), self._pin(v_s))
 
     def get(self, i, device):
         k_q, k_s = self.k[i]
-        v_q, v_s = self.v[i]
+        v_q, v_s = self.v[i] if self.v[i] is not None else (None, None)
         to = lambda t: None if t is None else t.to(device, non_blocking=True)
         return to(k_q), to(k_s), to(v_q), to(v_s)
 
@@ -207,15 +223,20 @@ class _StoreDisk:
 
     name = "disk"
 
-    def __init__(self, n_blocks, codec, s, d, device):
+    def __init__(self, n_blocks, codec, s, d, device, pair=True):
         self.n_blocks = n_blocks
-        self.dir = tempfile.mkdtemp(prefix="h3_frozen_cache_", dir=_disk_base_dir())
+        base = _disk_base_dir()
+        _sweep_stale_dirs(base)
+        self.dir = tempfile.mkdtemp(prefix="h3_frozen_cache_", dir=base)
+        _LIVE_DISK_DIRS.add(self.dir)
+        self._fin = weakref.finalize(self, _cleanup_disk_dir, self.dir)
         p_shape, p_dtype = codec.payload_shape(s, d)
         s_shape, s_dtype = codec.scales_shape(s, d)
         self.shapes = (p_shape, p_dtype, s_shape, s_dtype)
         self.mm = {}
-        for kind, shape, dtype in (("k", p_shape, p_dtype), ("v", p_shape, p_dtype),
-                                   ("ks", s_shape, s_dtype), ("vs", s_shape, s_dtype)):
+        v_shape, vs_shape = (p_shape, s_shape) if pair else (None, None)
+        for kind, shape, dtype in (("k", p_shape, p_dtype), ("v", v_shape, p_dtype),
+                                   ("ks", s_shape, s_dtype), ("vs", vs_shape, s_dtype)):
             if shape is None:
                 self.mm[kind] = None
                 continue
@@ -316,11 +337,26 @@ class _StoreDisk:
     def free(self):
         self.end_step()
         self.mm = {}
-        try:
-            import shutil
-            shutil.rmtree(self.dir, ignore_errors=True)
-        except Exception:
-            pass
+        self._fin()
+
+
+_LIVE_DISK_DIRS = set()
+
+
+def _cleanup_disk_dir(d):
+    _LIVE_DISK_DIRS.discard(d)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def _sweep_stale_dirs(base):
+    """Remove cache dirs orphaned by previous processes or dropped states."""
+    try:
+        for name in os.listdir(base):
+            p = os.path.join(base, name)
+            if name.startswith("h3_frozen_cache_") and p not in _LIVE_DISK_DIRS:
+                shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def _disk_base_dir():
@@ -349,20 +385,22 @@ class _Slot:
         self.steps_since_build = 0
         self.dq_k = None
         self.dq_v = None
+        self.dq_h = None
         self.seq_len = 0
 
     def free(self):
         if self.store is not None:
             self.store.free()
         self.store = None
-        self.dq_k = self.dq_v = None
+        self.dq_k = self.dq_v = self.dq_h = None
 
 
 class _State:
-    def __init__(self, backend, precision, refresh_interval):
+    def __init__(self, backend, precision, refresh_interval, contents="kv"):
         self.backend = backend
         self.precision = precision
         self.refresh_interval = refresh_interval
+        self.contents = contents
         self.slots = {}       # key -> _Slot (max 2, insertion-ordered LRU)
         # per-call, set by the wrapper before the block loop runs:
         self.mode = "off"     # off | build | cached
@@ -457,12 +495,16 @@ def _block_build(state, blk, args):
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = blk.adaln_proj(t_emb)
     h = mm_h3._mod_scale_shift(blk.norm1(x), shift_msa, scale_msa, mod_segments)
 
+    codec = state.slot.codec
+    if state.contents == "hidden":
+        h_q, h_s = codec.quantize(h)
+        state.slot.store.put(i, h_q, h_s, None, None)
     q, k, v = _attn_qkv_rope(blk.attn, h, rope_freqs)
     s = h.shape[0]
-    codec = state.slot.codec
-    k_q, k_s = codec.quantize(k.reshape(s, -1))
-    v_q, v_s = codec.quantize(v.reshape(s, -1))
-    state.slot.store.put(i, k_q, k_s, v_q, v_s)
+    if state.contents == "kv":
+        k_q, k_s = codec.quantize(k.reshape(s, -1))
+        v_q, v_s = codec.quantize(v.reshape(s, -1))
+        state.slot.store.put(i, k_q, k_s, v_q, v_s)
 
     vq = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
     vk = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
@@ -492,19 +534,29 @@ def _block_cached(state, blk, args):
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = blk.adaln_proj(t_emb)
 
     xa = x[aa:ab]
-    h = mm_h3._mod_scale_shift(blk.norm1(xa), shift_msa, scale_msa, seg)
-    q, k_live, v_live = _attn_qkv_rope(blk.attn, h, rope_freqs[:, aa:ab])
-
-    # cached K/V for the whole sequence, live audio slice patched in
-    k_q, k_s, v_q, v_s = slot.store.get(i, x.device)
-    codec = slot.codec
     heads, hd = blk.attn.heads, blk.attn.head_dim
-    codec.dequantize(k_q, k_s, slot.dq_k, x.dtype)
-    codec.dequantize(v_q, v_s, slot.dq_v, x.dtype)
-    kf = slot.dq_k.view(slot.seq_len, heads, hd)
-    vf = slot.dq_v.view(slot.seq_len, heads, hd)
-    kf[aa:ab] = k_live.to(kf.dtype)
-    vf[aa:ab] = v_live.to(vf.dtype)
+    codec = slot.codec
+    if state.contents == "hidden":
+        # rebuild K/V on the fly from the stored post-norm hidden states
+        h_q, h_s, _, _ = slot.store.get(i, x.device)
+        codec.dequantize(h_q, h_s, slot.dq_h, x.dtype)
+        h_a = mm_h3._mod_scale_shift(blk.norm1(xa), shift_msa, scale_msa, seg)
+        slot.dq_h[aa:ab] = h_a.to(slot.dq_h.dtype)
+        q_full, kf, vf = _attn_qkv_rope(blk.attn, slot.dq_h, rope_freqs)
+        q = q_full[aa:ab]
+        vf = vf.clone()
+    else:
+        h = mm_h3._mod_scale_shift(blk.norm1(xa), shift_msa, scale_msa, seg)
+        q, k_live, v_live = _attn_qkv_rope(blk.attn, h, rope_freqs[:, aa:ab])
+
+        # cached K/V for the whole sequence, live audio slice patched in
+        k_q, k_s, v_q, v_s = slot.store.get(i, x.device)
+        codec.dequantize(k_q, k_s, slot.dq_k, x.dtype)
+        codec.dequantize(v_q, v_s, slot.dq_v, x.dtype)
+        kf = slot.dq_k.view(slot.seq_len, heads, hd)
+        vf = slot.dq_v.view(slot.seq_len, heads, hd)
+        kf[aa:ab] = k_live.to(kf.dtype)
+        vf[aa:ab] = v_live.to(vf.dtype)
 
     cq = AttentionTensorContainer(q.to(kf.dtype).transpose(0, 1).unsqueeze(0))
     ck_ = AttentionTensorContainer(kf.transpose(0, 1).unsqueeze(0))
@@ -545,7 +597,11 @@ def make_block_replace(state, get_block, n_blocks):
             state.step_ctx["audio_mod_row"] = row
             state.step_ctx["block_index"] = 0
             if state.mode == "cached":
-                if state.slot.dq_k is None:
+                if state.contents == "hidden":
+                    if state.slot.dq_h is None:
+                        state.slot.dq_h = torch.empty((state.slot.seq_len, state.slot.store_d),
+                                                      dtype=args["img"].dtype, device=args["img"].device)
+                elif state.slot.dq_k is None:
                     d = state.slot.store_d
                     state.slot.dq_k = torch.empty((state.slot.seq_len, d), dtype=args["img"].dtype,
                                                   device=args["img"].device)
@@ -559,7 +615,7 @@ def make_block_replace(state, get_block, n_blocks):
     return block_replace
 
 
-def make_wrapper(state, n_blocks, d_kv):
+def make_wrapper(state, n_blocks, d_kv, d_hidden):
     def wrapper(executor, x, timestep, context, transformer_options={}, **kwargs):
         state.mode = "off"
         state.step_ctx = {}
@@ -603,17 +659,18 @@ def make_wrapper(state, n_blocks, d_kv):
                 if slot.store is not None:
                     slot.free()
                 codec = CODECS[state.precision]
-                total = codec.nbytes(seq_len, d_kv) * 2 * n_blocks
+                pair = state.contents == "kv"
+                d_store = d_kv if pair else d_hidden
+                total = codec.nbytes(seq_len, d_store) * (2 if pair else 1) * n_blocks
                 backend, why = _resolve_backend(state.backend, total, x[0].device)
-                log.info("H3 Frozen Video Cache: building cache | rows=%d kv_dim=%d blocks=%d "
-                         "precision=%s size=%.1f GB backend=%s (%s)",
-                         seq_len, d_kv, n_blocks, state.precision, total / 2**30, backend, why)
+                log.info("H3 Frozen Video Cache: building cache | rows=%d contents=%s dim=%d "
+                         "blocks=%d precision=%s size=%.1f GB backend=%s (%s)",
+                         seq_len, state.contents, d_store, n_blocks, state.precision,
+                         total / 2**30, backend, why)
                 slot.codec = codec
-                slot.store = STORES[backend](n_blocks, codec, seq_len, d_kv, x[0].device)
-                slot.layout_sig = sig
-                slot.video_fp = video_fp
+                slot.store = STORES[backend](n_blocks, codec, seq_len, d_store, x[0].device, pair=pair)
                 slot.seq_len = seq_len
-                slot.store_d = d_kv
+                slot.store_d = d_store
                 slot.steps_since_build = 0
                 state.mode = "build"
             else:
@@ -624,10 +681,19 @@ def make_wrapper(state, n_blocks, d_kv):
             state.slot = slot
             state.step_ctx = {"block_index": 0}
             try:
-                return executor(x, timestep, context, transformer_options, **kwargs)
+                ret = executor(x, timestep, context, transformer_options, **kwargs)
+            except BaseException:
+                if state.mode == "build":
+                    slot.free()  # interrupted build: never leave a half-written cache marked valid
+                raise
             finally:
                 if state.mode == "cached" and slot.store is not None:
                     slot.store.end_step()
+            if state.mode == "build":
+                # stamp validity only after the build completed every block
+                slot.layout_sig = sig
+                slot.video_fp = video_fp
+            return ret
         finally:
             state.mode = "off"
 
@@ -661,7 +727,7 @@ def check_core_compat(dm):
             "node needs an update. Bypass the node to keep working." % "; ".join(problems))
 
 
-def patch_model(model, backend, precision, refresh_interval):
+def patch_model(model, backend, precision, refresh_interval, cache_contents="kv"):
     if precision == "fp8" and _FP8 is None:
         raise RuntimeError("H3 Frozen Video Cache: this PyTorch build has no float8_e4m3fn; "
                            "use bf16 or int4 precision instead.")
@@ -669,11 +735,15 @@ def patch_model(model, backend, precision, refresh_interval):
     check_core_compat(dm)
     n_blocks = len(dm.blocks)
     d_kv = dm.blocks[0].attn.heads * dm.blocks[0].attn.head_dim
+    d_hidden = getattr(dm, "hidden_size", None)
+    if d_hidden is None:
+        d_hidden = dm.blocks[0].norm1.weight.shape[0]
 
     m = model.clone()
-    state = _State(backend, precision, refresh_interval)
+    state = _State(backend, precision, refresh_interval, cache_contents)
     replace = make_block_replace(state, lambda i: dm.blocks[i], n_blocks)
     for i in range(n_blocks):
         m.set_model_patch_replace(replace, "dit", "double_block", i)
-    m.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY, make_wrapper(state, n_blocks, d_kv))
+    m.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
+                           make_wrapper(state, n_blocks, d_kv, d_hidden))
     return m

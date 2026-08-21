@@ -123,19 +123,53 @@ anywhere.
   are not computed; the sampler's mask blend restores the real video in the output).
   The final latent is unaffected.
 
+**Cache contents** (`cache_contents` input): the storage/compute dial.
+- `hidden` (default) — stores each block's post-norm hidden states (5376/row) and rebuilds
+  K/V on the fly each cached step. ~2.7x smaller than `kv`; cached steps keep ~30% of the
+  per-block video matmul work (the qkv projection), so expect roughly ~3x faster refinement
+  steps. This is the config that fits a RAM-starved box where the model offload pool
+  already owns most of system memory.
+- `kv` — stores post-rope K/V directly (14336/row). Cached steps are nearly compute-free,
+  but you need the room to hold it.
+
 **Backends** (`backend` input): where the cache lives.
 - `auto` — picks the first of vram / ram / disk that fits with a 4 GB margin, and prints
   the choice and the reason to the console.
 - `vram` / `ram` / `disk` — force a placement. Disk caches live under the ComfyUI temp
   directory and are deleted when replaced.
 Cache size is printed on every build **before** allocation. Approximate sizes at
-1344×768 / 124 frames (~38k rows, 50 blocks): `bf16` ≈ 55 GB, `fp8` ≈ 27 GB,
-`int4` ≈ 14 GB. Sizes scale linearly with row count.
+1344×768 / 124 frames (~38k rows, 50 blocks), by contents x precision:
+
+| | `bf16` | `fp8` | `int4` |
+|---|---|---|---|
+| `kv` | ~55 GB | ~27 GB | ~14 GB |
+| `hidden` | ~21 GB | ~10.4 GB | ~5.3 GB |
+
+Sizes scale linearly with row count.
+
+**Other memory the cache uses** (not part of the number above):
+- Working VRAM during cached steps: `kv` holds two full-sequence dequant buffers
+  (~1.1 GB at full canvas); `hidden` holds one (~0.4 GB) plus the transient full-sequence
+  qkv activation (~1.6 GB peak).
+- The disk backend stages through two double-buffered pinned blocks (~0.5 GB RAM for
+  `kv`/int4, ~0.2 GB for `hidden`/int4).
+- If pinned allocation fails under RAM pressure, the RAM backend falls back to pageable
+  memory with a console warning (slightly slower transfers, but the cache can swap
+  instead of the process being killed).
 
 **Precision** (`precision` input): `int4` (group-128 symmetric; default — smallest and
 fastest to stream), `fp8` (per-row scaled e4m3), `bf16` (exact). Verified cached-step
-deviation on the test model: bf16 ~0, fp8 ~4e-4 relative, int4 ~2e-3 relative — small
-against the approximation itself.
+deviation on the test model, both contents modes: bf16 ~0, fp8 ~4e-4 relative, int4
+~2e-3 relative — small against the approximation itself, and `hidden` does not amplify
+quantization error through the rebuilt projection (measured 0.0022 vs 0.0020 for `kv`
+at int4).
+
+**Lifecycle:** the cache persists across queue runs on purpose (re-queueing the same
+refine skips the rebuild) and is invalidated automatically by a new video latent (new
+seed), a layout change, or eviction (2 slots max). Disk caches live under the ComfyUI
+temp directory: stale directories are swept on the next build, orphans are cleared by
+ComfyUI's own temp cleanup at startup, and an interrupted build is discarded rather than
+left half-written (verified: a post-interrupt run rebuilds cleanly).
 
 **Compatibility:** the cache reuses ComfyUI core's own kernels (fused RMSNorm+rope,
 optimized attention, swiglu) so the build step reproduces the stock forward exactly

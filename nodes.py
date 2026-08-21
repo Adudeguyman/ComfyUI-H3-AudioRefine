@@ -196,6 +196,13 @@ class H3FrozenVideoCache:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "MiniMax H3 model, after the LoRA/patch stack."}),
+                "cache_contents": (["hidden", "kv"], {
+                    "default": "hidden",
+                    "tooltip": "What to cache per block for the frozen rows. hidden: post-norm hidden "
+                               "states (~2.7x smaller: ~5.3 GB int4 at full canvas), K/V rebuilt on the "
+                               "fly each step (~30% of video compute remains; ~3x faster cached steps). "
+                               "kv: post-rope K/V directly (~14 GB int4), cached steps nearly free -- "
+                               "needs the RAM/VRAM to hold it."}),
                 "backend": (["auto", "vram", "ram", "disk"], {
                     "default": "auto",
                     "tooltip": "Where the cache lives. auto picks the first of vram/ram/disk that fits "
@@ -212,9 +219,10 @@ class H3FrozenVideoCache:
             },
         }
 
-    def patch(self, model, backend, precision, refresh_interval):
+    def patch(self, model, cache_contents, backend, precision, refresh_interval):
         from . import frozen_cache
-        return (frozen_cache.patch_model(model, backend, precision, refresh_interval),)
+        return (frozen_cache.patch_model(model, backend, precision, refresh_interval,
+                                         cache_contents=cache_contents),)
 
 
 NODE_CLASS_MAPPINGS = {
