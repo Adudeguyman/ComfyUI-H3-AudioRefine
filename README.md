@@ -30,6 +30,58 @@ context, so each audio refinement step still costs close to a full forward
 pass. The saving is step arithmetic (4 turbo + 4-6 audio ~= 8-10 full-cost
 steps vs 20), not per-step cost.
 
+## Example workflow
+
+![Wiring the refine pass with the frozen video cache](examples/workflow.png)
+
+`SamplerCustomAdvanced` runs the turbo pass; its LATENT goes to `H3 Audio Refine
+Sampler`, which takes its MODEL from `H3 Frozen Video Cache` (placed after the LoRA
+stack). `positive` is wired into `negative` as well, since `cfg 1.0` never evaluates the
+uncond branch.
+
+Sample output from that graph: [`examples/turbo-refined.mp4`](examples/turbo-refined.mp4)
+-- 6 turbo steps, then 6 audio-only refinement steps.
+
+The node timings in that screenshot are the honest measurement of what this pack buys:
+
+| | steps | time | per step |
+|---|---|---|---|
+| Turbo pass (joint video + audio) | 6 | 93.7s | ~15.6s |
+| Audio refinement, frozen cache on | 6 | 45.6s | ~7.6s |
+
+The refinement average includes the one full-price cache build, so the steps after it are
+considerably cheaper than 7.6s -- that is where the `verbose` per-step log is worth
+reading.
+
+## Do I want the frozen cache?
+
+Both paths produce the same kind of result. They differ in what they spend.
+
+**Without the cache** (bypass the node, or just don't add it) the refinement pass is
+resource-free -- no extra RAM, no extra VRAM, nothing on disk -- and it is exact, with no
+approximation anywhere. The cost is time: because H3 packs video and audio into one
+sequence with full bidirectional attention, every refinement step re-runs the entire video
+stream through all 50 blocks even though the video is frozen and its output is discarded.
+So each audio-only step costs about the same as a full generation step. Six refinement
+steps costs roughly what six more generation steps would.
+
+**With the cache**, the frozen rows' per-block state is computed once and reused, so later
+steps only compute the audio rows. Refinement steps get substantially cheaper, at three
+costs: a chunk of RAM/VRAM/disk to hold the cache (7-8 GB at `hidden`/`int4` on a typical
+clip, more at `kv` or lower compression), a first refinement step at full price to build
+it, and a mild approximation -- the frozen rows stop reacting to the evolving audio
+between rebuilds (see `refresh_interval`).
+
+Rough guidance:
+
+- **Few refinement steps (2-3), or memory is tight.** Skip the cache. The build step eats
+  most of the saving, and you avoid the memory entirely.
+- **Many refinement steps (6+) and you can spare the memory.** Use the cache. The build
+  amortizes and the remaining steps are a fraction of full price.
+- **Not sure whether it is helping.** Turn on `verbose` and compare a run with the node
+  bypassed against one with it active. The per-step log tells you where the time went
+  rather than leaving you to infer it.
+
 ## Nodes
 
 ### H3 Audio Refine Sampler (all-in-one)
