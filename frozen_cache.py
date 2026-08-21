@@ -854,7 +854,12 @@ def check_core_compat(dm):
 
 
 def patch_model(model, backend, precision, refresh_interval, cache_contents="kv", verbose=False,
-                allow_disk=False):
+                allow_disk=False, enabled=True):
+    if not enabled:
+        # Return the model untouched: no wrapper, no block patches, no compat check.
+        # Identical to bypassing the node, but keeps the graph wiring intact.
+        log.info("H3 Frozen Video Cache: disabled -- model passed through unpatched.")
+        return model
     if precision == "fp8" and _FP8 is None:
         raise RuntimeError("H3 Frozen Video Cache: this PyTorch build has no float8_e4m3fn; "
                            "use bf16 or int4 precision instead.")

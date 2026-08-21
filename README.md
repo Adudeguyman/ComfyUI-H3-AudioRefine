@@ -202,6 +202,11 @@ video). On every later step it computes **only the audio rows** (~1% of the sequ
 attending against the cached K/V, instead of re-running ~37k video tokens through all 50
 blocks.
 
+**`enabled`** turns the cache off without rewiring: the model is returned completely
+unpatched, no wrapper, no block patches, no memory allocated -- identical to bypassing the
+node. Refinement then runs at full price per step. Use it to A/B a cached run against an
+uncached one without touching the graph.
+
 **Wiring:** place after your LoRA/patch stack, feed the patched MODEL into the refine
 sampler (`H3 Audio Refine Sampler` or a stock sampler fed by `H3 Audio Refine Mask`).
 The patch self-gates: it only activates when the model is called with the video stream

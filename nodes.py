@@ -196,6 +196,12 @@ class H3FrozenVideoCache:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "MiniMax H3 model, after the LoRA/patch stack."}),
+                "enabled": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Turn the cache off without rewiring. When off, the model is passed "
+                               "through completely unpatched -- identical to bypassing this node, "
+                               "no memory allocated, refinement runs at full price per step. Handy "
+                               "for A/B timing against a cached run."}),
                 "cache_contents": (["hidden", "kv"], {
                     "default": "hidden",
                     "tooltip": "What to cache per block for the frozen rows. hidden: post-norm hidden "
@@ -232,12 +238,12 @@ class H3FrozenVideoCache:
             },
         }
 
-    def patch(self, model, cache_contents, backend, precision, refresh_interval, verbose=False,
-              allow_disk=False):
+    def patch(self, model, enabled, cache_contents, backend, precision, refresh_interval,
+              verbose=False, allow_disk=False):
         from . import frozen_cache
         return (frozen_cache.patch_model(model, backend, precision, refresh_interval,
                                          cache_contents=cache_contents, verbose=verbose,
-                                         allow_disk=allow_disk),)
+                                         allow_disk=allow_disk, enabled=enabled),)
 
 
 NODE_CLASS_MAPPINGS = {
