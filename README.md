@@ -104,8 +104,10 @@ blocks.
 
 **Wiring:** place after your LoRA/patch stack, feed the patched MODEL into the refine
 sampler (`H3 Audio Refine Sampler` or a stock sampler fed by `H3 Audio Refine Mask`).
-The patch self-gates: it only activates when the model is called with video fully frozen
-and audio fully generated. Pass-1 sampling, partial video masks, and audio-mask workflows
+The patch self-gates: it only activates when the model is called with the video stream
+fully frozen and the audio stream still generating. On the first refinement step it logs
+`building cache | rows=... size=... backend=...` to the console -- if you never see that
+line, the cache is not engaging and the pass is running at stock speed. Pass-1 sampling, partial video masks, and audio-mask workflows
 pass through the stock path bit-for-bit, so the same patched MODEL is safe to wire
 anywhere.
 
