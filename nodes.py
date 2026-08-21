@@ -174,12 +174,57 @@ class H3AudioRefineSampler:
         return (out,)
 
 
+class H3FrozenVideoCache:
+    """Patch the model with the frozen-video KV cache accelerator for refinement passes."""
+
+    CATEGORY = "model/minimax"
+    FUNCTION = "patch"
+    RETURN_TYPES = ("MODEL",)
+    DESCRIPTION = (
+        "Accelerates the H3 audio refinement pass: caches each block's K/V for the frozen "
+        "video/text/cond rows on the first refinement step and computes only the audio rows "
+        "afterwards. Approximation: cached rows stop reacting to the audio between rebuilds "
+        "(refresh_interval > 0 rebuilds every N steps at full cost). Only activates when the "
+        "model runs with video fully frozen and audio fully generated -- all other calls, "
+        "including normal pass-1 sampling, pass through exactly. Place after the LoRA/patch "
+        "stack, feed the patched MODEL to the refine sampler. Cache size and backend choice "
+        "are printed to the console on every build."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "MiniMax H3 model, after the LoRA/patch stack."}),
+                "backend": (["auto", "vram", "ram", "disk"], {
+                    "default": "auto",
+                    "tooltip": "Where the cache lives. auto picks the first of vram/ram/disk that fits "
+                               "(with margin) and reports the choice. disk works on any machine."}),
+                "precision": (["int4", "fp8", "bf16"], {
+                    "default": "int4",
+                    "tooltip": "Cache storage precision. int4 (group-128) is smallest and fastest to "
+                               "stream (~14 GB at full canvas); fp8 ~27 GB; bf16 ~55 GB, exact."}),
+                "refresh_interval": ("INT", {
+                    "default": 0, "min": 0, "max": 100,
+                    "tooltip": "Rebuild the cache every N refinement steps (each rebuild costs one "
+                               "full-price step) so the frozen rows periodically see the current "
+                               "audio. 0 = build once, never refresh."}),
+            },
+        }
+
+    def patch(self, model, backend, precision, refresh_interval):
+        from . import frozen_cache
+        return (frozen_cache.patch_model(model, backend, precision, refresh_interval),)
+
+
 NODE_CLASS_MAPPINGS = {
     "H3AudioRefineMask": H3AudioRefineMask,
     "H3AudioRefineSampler": H3AudioRefineSampler,
+    "H3FrozenVideoCache": H3FrozenVideoCache,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3AudioRefineMask": "H3 Audio Refine Mask",
     "H3AudioRefineSampler": "H3 Audio Refine Sampler",
+    "H3FrozenVideoCache": "H3 Frozen Video Cache",
 }

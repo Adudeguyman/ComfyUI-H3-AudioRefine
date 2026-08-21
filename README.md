@@ -93,3 +93,53 @@ is the honest baseline this approach has to beat.
 ## Changelog
 
 - 1.0.0: Initial release. H3AudioRefineMask, H3AudioRefineSampler.
+
+## H3 Frozen Video Cache
+
+Accelerates the refinement pass. On the first refinement step it runs the model normally
+while recording every block's post-rope attention K/V for the frozen rows (text, cond/ref,
+video). On every later step it computes **only the audio rows** (~1% of the sequence),
+attending against the cached K/V, instead of re-running ~37k video tokens through all 50
+blocks.
+
+**Wiring:** place after your LoRA/patch stack, feed the patched MODEL into the refine
+sampler (`H3 Audio Refine Sampler` or a stock sampler fed by `H3 Audio Refine Mask`).
+The patch self-gates: it only activates when the model is called with video fully frozen
+and audio fully generated. Pass-1 sampling, partial video masks, and audio-mask workflows
+pass through the stock path bit-for-bit, so the same patched MODEL is safe to wire
+anywhere.
+
+**What it costs (honesty section):**
+- This is an approximation: between rebuilds, the frozen rows stop reacting to the
+  evolving audio. `refresh_interval N` rebuilds the cache every N steps (each rebuild is
+  one full-price step) if you want to periodically re-open that feedback path. `0` =
+  build once.
+- The first refinement step is always full price — it builds the cache.
+- Cached steps are not free: model weights still stream per step if your model is
+  offloaded to RAM, and the cache itself streams from wherever it lives. Expect cached
+  steps to cost roughly (weight streaming) + (cache transfer) + (tiny audio compute),
+  not zero.
+- The latent preview will show garbage video during cached refinement steps (video rows
+  are not computed; the sampler's mask blend restores the real video in the output).
+  The final latent is unaffected.
+
+**Backends** (`backend` input): where the cache lives.
+- `auto` — picks the first of vram / ram / disk that fits with a 4 GB margin, and prints
+  the choice and the reason to the console.
+- `vram` / `ram` / `disk` — force a placement. Disk caches live under the ComfyUI temp
+  directory and are deleted when replaced.
+Cache size is printed on every build **before** allocation. Approximate sizes at
+1344×768 / 124 frames (~38k rows, 50 blocks): `bf16` ≈ 55 GB, `fp8` ≈ 27 GB,
+`int4` ≈ 14 GB. Sizes scale linearly with row count.
+
+**Precision** (`precision` input): `int4` (group-128 symmetric; default — smallest and
+fastest to stream), `fp8` (per-row scaled e4m3), `bf16` (exact). Verified cached-step
+deviation on the test model: bf16 ~0, fp8 ~4e-4 relative, int4 ~2e-3 relative — small
+against the approximation itself.
+
+**Compatibility:** the cache reuses ComfyUI core's own kernels (fused RMSNorm+rope,
+optimized attention, swiglu) so the build step reproduces the stock forward exactly
+(verified bit-identical on CPU against core). Core internals are structurally checked at
+patch time and per step; any mismatch falls back loudly to the exact path rather than
+producing wrong output. If your attention backend cannot handle cross-length q/kv
+(audio queries vs full-sequence keys), switch attention backends for the refine pass.
