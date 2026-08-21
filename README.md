@@ -42,22 +42,38 @@ uncond branch.
 Sample output from that graph: [`examples/turbo-refined.mp4`](examples/turbo-refined.mp4)
 -- 6 turbo steps, then 6 audio-only refinement steps.
 
-The node timings in that screenshot are the honest measurement of what this pack buys:
+### Measured
 
-| | steps | time | per step |
+Three runs of the same graph, from the console (a longer clip than the screenshot --
+75,208 packed rows, 9.7 GB cache at `hidden`/`int4` in system RAM):
+
+| | steps | refinement pass | whole prompt |
 |---|---|---|---|
-| Turbo pass (joint video + audio) | 6 | 93.7s | ~15.6s |
-| Audio refinement, frozen cache on | 6 | 45.6s | ~7.6s |
+| Turbo only, no refinement | 4 | -- | 136.5s |
+| + refinement, cache bypassed | 4 + 6 | 124.0s (20.7s/step) | 264.9s |
+| + refinement, frozen cache | 4 + 6 | 45.7s (26.9s build, then 3.8s/step) | 185.8s |
 
-The refinement average includes the one full-price cache build, so the steps after it are
-considerably cheaper than 7.6s -- that is where the `verbose` per-step log is worth
-reading.
+So on this machine: **5.5x per cached step** (20.7s -> 3.8s), **2.7x on the refinement
+pass** as a whole once the build is counted, and **1.4x on the end-to-end job** -- 79
+seconds saved on a 265-second render.
+
+Two things worth reading out of that:
+
+- Building the cache costs about 30% more than a normal step (26.9s vs 20.7s), which is
+  the price of capturing and quantizing 50 blocks of frozen-row state.
+- Refinement steps are *not* free without the cache: 20.7s each, against 24.0s for a full
+  turbo step. Freezing the video saves almost nothing by itself, because the frozen rows
+  still run through every block. That gap is the entire reason this cache exists.
+
+The `verbose` log shows where the time goes -- on cached steps here, `block loop 3.70s`
+of a `3.75s` model call, so essentially all of it is the transformer and almost none is
+overhead.
 
 **These numbers are from one machine and are not a promise.** They were measured on an
 RTX 5090 (32 GB) with the cache in system RAM at `hidden`/`int4`, on one clip at one
-resolution. Both the absolute times and the ratio between them will move with your GPU,
-your resolution and frame count, where the cache ends up living (VRAM, RAM, or disk), and
-whether the model itself fits in VRAM or is being streamed. On a card where weight
+resolution. Both the absolute times and the ratios will move with your GPU, your
+resolution and frame count, where the cache ends up living (VRAM, RAM, or disk), and
+whether the model itself fits in VRAM or is being streamed. On a setup where weight
 streaming dominates the step, the saving will be much smaller than this table suggests --
 the cache only removes compute, and it cannot help with time that is not being spent on
 compute. Measure your own with `verbose` rather than working from these.
@@ -76,17 +92,20 @@ steps costs roughly what six more generation steps would.
 
 **With the cache**, the frozen rows' per-block state is computed once and reused, so later
 steps only compute the audio rows. Refinement steps get substantially cheaper, at three
-costs: a chunk of RAM/VRAM/disk to hold the cache (7-8 GB at `hidden`/`int4` for the clip above, more
-at `kv` or lower compression, and it scales with resolution and frame count), a first refinement step at full price to build
+costs: a chunk of RAM/VRAM/disk to hold the cache (around 10 GB at `hidden`/`int4` for the clip
+measured above, more at `kv` or lower compression, scaling with resolution and frame
+count), a first refinement step at full price to build
 it, and a mild approximation -- the frozen rows stop reacting to the evolving audio
 between rebuilds (see `refresh_interval`).
 
 Rough guidance:
 
-- **Few refinement steps (2-3), or memory is tight.** Skip the cache. The build step eats
-  most of the saving, and you avoid the memory entirely.
-- **Many refinement steps (6+) and you can spare the memory.** Use the cache. The build
-  amortizes and the remaining steps are a fraction of full price.
+- **Memory is tight.** Skip the cache. This is the real deciding question, not step count.
+  A refinement pass without it is slower but costs nothing beyond what generation already
+  uses, and it is exact.
+- **You can spare the memory.** Use the cache from about 2 refinement steps upward. On the
+  measurements above the build pays for itself after roughly 1.4 steps, so even short
+  refinement runs come out ahead; longer ones come out far ahead.
 - **Not sure whether it is helping.** Turn on `verbose` and compare a run with the node
   bypassed against one with it active. The per-step log tells you where the time went
   rather than leaving you to infer it.
