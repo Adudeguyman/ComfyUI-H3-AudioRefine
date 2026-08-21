@@ -398,8 +398,10 @@ class _Slot:
 
 
 class _State:
-    def __init__(self, backend, precision, refresh_interval, contents="kv", verbose=False):
+    def __init__(self, backend, precision, refresh_interval, contents="kv", verbose=False,
+                 allow_disk=False):
         self.verbose = verbose
+        self.allow_disk = allow_disk
         self.backend = backend
         self.precision = precision
         self.refresh_interval = refresh_interval
@@ -453,9 +455,21 @@ def _fp_matches(a, b):
     return True
 
 
-def _resolve_backend(requested, total_bytes, device):
+_DISK_HELP = (
+    "The disk backend is off by default because it writes the whole cache to your drive "
+    "on every build -- gigabytes per run, which is real SSD wear. Enable the 'allow_disk' "
+    "toggle on the H3 Frozen Video Cache node if you accept that, or reduce the cache size "
+    "(cache_contents=hidden, precision=int4) so it fits in RAM or VRAM, or bypass the node "
+    "to run the refinement pass without a cache at all."
+)
+
+
+def _resolve_backend(requested, total_bytes, device, allow_disk=False):
     reasons = []
     if requested != "auto":
+        if requested == "disk" and not allow_disk:
+            raise RuntimeError("H3 Frozen Video Cache: backend is set to 'disk' but disk "
+                               "writing is not enabled. " + _DISK_HELP)
         return requested, "requested"
     try:
         free_vram = comfy.model_management.get_free_memory(device)
@@ -468,6 +482,11 @@ def _resolve_backend(requested, total_bytes, device):
     if ram is not None and total_bytes + 4 * (1 << 30) < ram:
         return "ram", "fits in available system RAM (%.1f GB available)" % (ram / 2**30)
     reasons.append("RAM: %.1f GB available" % ((ram or 0) / 2**30))
+    if not allow_disk:
+        raise RuntimeError(
+            "H3 Frozen Video Cache: the cache needs %.1f GB and does not fit in VRAM or "
+            "RAM (%s), and disk writing is not enabled. %s"
+            % (total_bytes / 2**30, "; ".join(reasons), _DISK_HELP))
     return "disk", "; ".join(reasons)
 
 
@@ -705,11 +724,16 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                 pair = state.contents == "kv"
                 d_store = d_kv if pair else d_hidden
                 total = codec.nbytes(seq_len, d_store) * (2 if pair else 1) * n_blocks
-                backend, why = _resolve_backend(state.backend, total, x[0].device)
+                backend, why = _resolve_backend(state.backend, total, x[0].device,
+                                                allow_disk=state.allow_disk)
                 log.info("H3 Frozen Video Cache: building cache (%s) | rows=%d contents=%s "
                          "dim=%d blocks=%d precision=%s size=%.1f GB backend=%s (%s)",
                          reason, seq_len, state.contents, d_store, n_blocks, state.precision,
                          total / 2**30, backend, why)
+                if backend == "disk":
+                    log.warning("H3 Frozen Video Cache: writing %.1f GB to disk for this cache "
+                                "build. Repeated runs cause real SSD wear -- see the disk wear "
+                                "note in the README.", total / 2**30)
                 slot.codec = codec
                 slot.store = STORES[backend](n_blocks, codec, seq_len, d_store, x[0].device, pair=pair)
                 slot.seq_len = seq_len
@@ -785,7 +809,8 @@ def check_core_compat(dm):
             "node needs an update. Bypass the node to keep working." % "; ".join(problems))
 
 
-def patch_model(model, backend, precision, refresh_interval, cache_contents="kv", verbose=False):
+def patch_model(model, backend, precision, refresh_interval, cache_contents="kv", verbose=False,
+                allow_disk=False):
     if precision == "fp8" and _FP8 is None:
         raise RuntimeError("H3 Frozen Video Cache: this PyTorch build has no float8_e4m3fn; "
                            "use bf16 or int4 precision instead.")
@@ -798,7 +823,8 @@ def patch_model(model, backend, precision, refresh_interval, cache_contents="kv"
         d_hidden = dm.blocks[0].norm1.weight.shape[0]
 
     m = model.clone()
-    state = _State(backend, precision, refresh_interval, cache_contents, verbose=verbose)
+    state = _State(backend, precision, refresh_interval, cache_contents, verbose=verbose,
+                   allow_disk=allow_disk)
     replace = make_block_replace(state, lambda i: dm.blocks[i], n_blocks)
     for i in range(n_blocks):
         m.set_model_patch_replace(replace, "dit", "double_block", i)

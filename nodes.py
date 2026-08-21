@@ -222,13 +222,22 @@ class H3FrozenVideoCache:
                                "cached / build / stock path, time spent inside the patched blocks, "
                                "and time spent in the rest of the model call. Use this to find out "
                                "where a refinement step is actually spending its time."}),
+                "allow_disk": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Allow the cache to be written to disk. OFF by default: a disk "
+                               "cache writes the whole thing (several GB) to your drive on every "
+                               "build, which is significant SSD wear over repeated runs. With this "
+                               "off, the node raises a clear error instead of falling back to disk "
+                               "when the cache does not fit in VRAM or RAM."}),
             },
         }
 
-    def patch(self, model, cache_contents, backend, precision, refresh_interval, verbose=False):
+    def patch(self, model, cache_contents, backend, precision, refresh_interval, verbose=False,
+              allow_disk=False):
         from . import frozen_cache
         return (frozen_cache.patch_model(model, backend, precision, refresh_interval,
-                                         cache_contents=cache_contents, verbose=verbose),)
+                                         cache_contents=cache_contents, verbose=verbose,
+                                         allow_disk=allow_disk),)
 
 
 NODE_CLASS_MAPPINGS = {

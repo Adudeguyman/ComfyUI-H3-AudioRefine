@@ -30,6 +30,26 @@ context, so each audio refinement step still costs close to a full forward
 pass. The saving is step arithmetic (4 turbo + 4-6 audio ~= 8-10 full-cost
 steps vs 20), not per-step cost.
 
+> ## ⚠️ Disk caching is OFF by default — read this before turning it on
+>
+> The `disk` backend writes the **entire cache to your drive on every build** — around
+> **10 GB per run** on the clip measured below, and again every time the cache is
+> invalidated (new seed, new prompt, or every `refresh_interval` steps).
+>
+> That adds up fast. Thirty renders in an evening is roughly **300 GB written**. Doing
+> that daily is **~110 TB a year** — a large fraction of a typical consumer NVMe's rated
+> endurance (often 600–1200 TBW), spent entirely on scratch data that is thrown away.
+>
+> The `allow_disk` toggle on the node exists so this can never happen by accident. With
+> it off, the node raises a clear error rather than quietly falling back to disk when the
+> cache does not fit in VRAM or RAM. **Before enabling it, prefer:** `cache_contents=hidden`
+> with `precision=int4` (the smallest configuration), or simply bypassing the node — the
+> refinement pass works fine without a cache, it is just slower.
+>
+> If you do enable it, point ComfyUI's temp directory at a drive you do not mind wearing
+> out (`--temp-directory`), ideally a spinning disk or a scratch SSD rather than your
+> system drive.
+
 ## Example workflow
 
 ![Wiring the refine pass with the frozen video cache](examples/workflow.png)
@@ -216,9 +236,12 @@ anywhere.
 
 **Backends** (`backend` input): where the cache lives.
 - `auto` — picks the first of vram / ram / disk that fits with a 4 GB margin, and prints
-  the choice and the reason to the console.
-- `vram` / `ram` / `disk` — force a placement. Disk caches live under the ComfyUI temp
-  directory and are deleted when replaced.
+  the choice and the reason to the console. It will only consider disk if `allow_disk` is
+  on; otherwise it raises an error explaining what did not fit rather than falling back.
+- `vram` / `ram` / `disk` — force a placement. Selecting `disk` without `allow_disk` is an
+  error, not a silent downgrade. Disk caches live under the ComfyUI temp directory and are
+  deleted when replaced.
+- `allow_disk` — off by default. See the disk wear warning at the top of this README.
 Cache size is printed on every build **before** allocation. Approximate sizes at
 1344×768 / 124 frames (~38k rows, 50 blocks), by contents x precision:
 
