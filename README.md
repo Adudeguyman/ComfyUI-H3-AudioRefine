@@ -64,7 +64,7 @@ stack). `positive` is wired into `negative` as well, since `cfg 1.0` never evalu
 uncond branch.
 
 Sample output from that graph: [`examples/turbo-refined.mp4`](examples/turbo-refined.mp4)
--- 6 turbo steps, then 6 audio-only refinement steps.
+-- 1376x768, 30s, turbo pass followed by 6 audio-only refinement steps.
 
 ### Measured
 
