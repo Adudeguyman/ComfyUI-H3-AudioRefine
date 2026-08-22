@@ -488,6 +488,12 @@ def _fp_matches(a, b):
     return True
 
 
+# Measured on a real build: a 9.7 GB packed RAM cache cost ~14.9 GB of resident RSS.
+# Allocator slack, per-tensor pinning overhead (50 blocks x 4 tensors), and fragmentation
+# make the true host footprint ~1.5x the packed size. Used for both the auto-backend fit
+# test and the room we ask comfy to clear.
+RAM_OVERHEAD_FACTOR = 1.5
+
 _DISK_HELP = (
     "The disk backend is off by default because it writes the whole cache to your drive "
     "on every build -- gigabytes per run, which is real SSD wear. Enable the 'allow_disk' "
@@ -512,8 +518,10 @@ def _resolve_backend(requested, total_bytes, device, allow_disk=False):
         return "vram", "fits in free VRAM (%.1f GB free)" % (free_vram / 2**30)
     reasons.append("VRAM: need %.1f GB + 4 GB margin, %.1f GB free" % (total_bytes / 2**30, free_vram / 2**30))
     ram = _meminfo_available_bytes()
-    if ram is not None and total_bytes + 4 * (1 << 30) < ram:
-        return "ram", "fits in available system RAM (%.1f GB available)" % (ram / 2**30)
+    ram_need = int(total_bytes * RAM_OVERHEAD_FACTOR)
+    if ram is not None and ram_need + 4 * (1 << 30) < ram:
+        return "ram", ("fits in available system RAM (%.1f GB needed incl. overhead, "
+                       "%.1f GB available)" % (ram_need / 2**30, ram / 2**30))
     reasons.append("RAM: %.1f GB available" % ((ram or 0) / 2**30))
     if not allow_disk:
         raise RuntimeError(
@@ -772,9 +780,13 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                 # the runway at build time.
                 try:
                     vram_needed = working_vram + (total if backend == "vram" else 0)
+                    ram_ask = int(total * RAM_OVERHEAD_FACTOR) if backend == "ram" else 0
+                    # pins_required routes into comfy's pin budget: it frees comfy's own
+                    # pinned staged weights against measured available RAM, which is the
+                    # RAM-side equivalent of the VRAM eviction above.
                     comfy.model_management.free_memory(
                         vram_needed + (1 << 30), x[0].device,
-                        ram_required=(total if backend == "ram" else 0))
+                        pins_required=ram_ask, ram_required=ram_ask)
                 except Exception as e:
                     state.warn_once("free_memory",
                                     "free_memory() request failed (%s); continuing, but "
@@ -785,6 +797,10 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                          reason, seq_len, state.contents, d_store, n_blocks, state.precision,
                          total / 2**30, backend, why, working_vram / 2**30,
                          (total + working_vram) / 2**30)
+                if backend == "ram":
+                    log.info("H3 Frozen Video Cache: expect ~%.1f GB host RAM resident for the "
+                             "%.1f GB packed cache (measured ~%.1fx allocator/pinning overhead)",
+                             total * RAM_OVERHEAD_FACTOR / 2**30, total / 2**30, RAM_OVERHEAD_FACTOR)
                 if backend == "disk":
                     log.warning("H3 Frozen Video Cache: writing %.1f GB to disk for this cache "
                                 "build. Repeated runs cause real SSD wear -- see the disk wear "

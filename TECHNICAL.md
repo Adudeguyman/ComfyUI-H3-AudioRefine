@@ -264,6 +264,14 @@ weights stream back per step on demand — that is the dynamic loader's normal j
 cost is transfer, not correctness. The request is best-effort and failure falls through
 with a warning rather than blocking the build.
 
+The same coordination exists on the host side. `free_memory(pins_required=N)` routes into
+`ensure_pin_budget()`, which computes the shortfall against measured available RAM (with a
+~2 GB floor) and frees comfy's own pinned staged weights to cover it. The ask is sized at
+`RAM_OVERHEAD_FACTOR` (1.5x) times the packed cache -- measured, not padded: a 9.7 GB
+packed cache cost ~14.9 GB resident, from allocator slack, per-tensor pinning overhead
+across 50 blocks x 4 tensors, and fragmentation. The auto-backend RAM fit test uses the
+same factor, so `auto` decides against the footprint that will actually materialise.
+
 ### Memory reporting
 
 `MemAvailable` is a kernel *estimate* of what could be reclaimed under pressure, not a

@@ -203,6 +203,8 @@ is the honest baseline this approach has to beat.
   so weights are evicted deliberately instead of colliding with an untracked allocation.
 - Build log reports the full expected resident footprint (packed + working buffers), not
   just the packed size.
+- RAM backend now requests comfy's pin budget (freeing comfy's own pinned staging) sized
+  at a measured 1.5x overhead factor, and auto's RAM fit test uses the same factor.
 
 - 1.0.0: Initial release. H3AudioRefineMask, H3AudioRefineSampler.
 
@@ -304,10 +306,16 @@ Every build also logs *why* it rebuilt (`no cache yet`, `video latent changed`,
 line on **every** step, the cache is never being reused and the pass is running slower
 than stock -- the reason field says what is invalidating it.
 
-**Coexisting with ComfyUI's memory manager:** the cache is not tracked by comfy's VRAM
+**Coexisting with ComfyUI's memory manager:** the cache is not tracked by comfy's
 accounting, so before allocating, the node asks `free_memory()` to clear the room it
 needs -- comfy then evicts model weights deliberately instead of colliding with an
-allocation it cannot see. The build log reports the packed cache size, the VRAM working
+allocation it cannot see. This works on both sides: a VRAM request for the working
+buffers (plus the packed cache on the `vram` backend), and on the `ram` backend a pin
+budget request sized at ~1.5x the packed cache -- the measured real footprint of a pinned
+host allocation, not the optimistic packed size -- which makes comfy free its own pinned
+staged weights against actually-available RAM. The auto-backend fit test uses the same
+1.5x figure, so `auto` no longer chooses RAM on headroom that would not survive the
+allocation. The build log reports the packed cache size, the VRAM working
 buffers on top of it, and the rough total resident footprint. If you still hit CUDA OOM
 with the cache in VRAM, `--vram-headroom 2` (or a bit more) tells comfy to keep that much
 VRAM free at all times, which gives eviction a head start.
