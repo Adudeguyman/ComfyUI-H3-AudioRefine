@@ -12,6 +12,10 @@ For how the cache actually works internally -- the packed layout, the ComfyUI ho
 approximation, the cost model, and notes for modifying it -- see
 [TECHNICAL.md](TECHNICAL.md).
 
+Example output -- 1376x768, 30s, turbo pass followed by 6 audio-only refinement steps:
+
+https://github.com/user-attachments/assets/e62f5618-5be3-477f-aaff-dbb7844e8f1c
+
 ## How it works
 
 ComfyUI's native MiniMax H3 support already contains a masked-inpaint path for
@@ -61,12 +65,7 @@ steps vs 20), not per-step cost.
 `SamplerCustomAdvanced` runs the turbo pass; its LATENT goes to `H3 Audio Refine
 Sampler`, which takes its MODEL from `H3 Frozen Video Cache` (placed after the LoRA
 stack). `positive` is wired into `negative` as well, since `cfg 1.0` never evaluates the
-uncond branch.
-
-Sample output from that graph -- 1376x768, 30s, turbo pass followed by 6 audio-only
-refinement steps:
-
-https://github.com/user-attachments/assets/e62f5618-5be3-477f-aaff-dbb7844e8f1c
+uncond branch. The clip at the top of this README is the output of this graph.
 
 ### Measured
 
