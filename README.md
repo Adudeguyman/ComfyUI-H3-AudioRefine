@@ -75,8 +75,8 @@ Three runs of the same graph, from the console (75,216 packed rows, 9.7 GB cache
 | | steps | refinement pass | whole prompt |
 |---|---|---|---|
 | Turbo only, no refinement | 4 | -- | 137.3s |
-| + refinement, cache bypassed | 4 + 6 | 124.0s (20.7s/step) | 263.4s |
 | + refinement, frozen cache | 4 + 6 | 44.6s (26.5s build, then 3.6s/step) | 184.6s |
+| + refinement, cache bypassed | 4 + 6 | 124.0s (20.7s/step) | 263.4s |
 
 So on this machine: **5.7x per cached step** (20.7s -> 3.6s), **2.8x on the refinement
 pass** as a whole once the build is counted, and **1.4x on the end-to-end job** -- 79

@@ -294,8 +294,8 @@ Measured on an RTX 5090, 75,216 rows, 9.7 GB cache in RAM at `hidden`/`int4`:
 | | steps | refinement pass | whole prompt |
 |---|---|---|---|
 | Turbo only, no refinement | 4 | — | 137.3s |
-| + refinement, cache bypassed | 4 + 6 | 124.0s (20.7s/step) | 263.4s |
 | + refinement, frozen cache | 4 + 6 | 44.6s (26.5s build, then 3.6s/step) | 184.6s |
+| + refinement, cache bypassed | 4 + 6 | 124.0s (20.7s/step) | 263.4s |
 
 3.6s / 20.7s ≈ **17.6%**, against a predicted 12%. The gap is cache streaming: ~9.7 GB
 moved from RAM to VRAM per step, plus dequantization. The model accounts for compute only.
