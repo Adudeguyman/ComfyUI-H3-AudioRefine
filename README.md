@@ -63,8 +63,10 @@ Sampler`, which takes its MODEL from `H3 Frozen Video Cache` (placed after the L
 stack). `positive` is wired into `negative` as well, since `cfg 1.0` never evaluates the
 uncond branch.
 
-Sample output from that graph: [`examples/turbo-refined.mp4`](examples/turbo-refined.mp4)
--- 1376x768, 30s, turbo pass followed by 6 audio-only refinement steps.
+Sample output from that graph -- 1376x768, 30s, turbo pass followed by 6 audio-only
+refinement steps:
+
+https://github.com/user-attachments/assets/e62f5618-5be3-477f-aaff-dbb7844e8f1c
 
 ### Measured
 
