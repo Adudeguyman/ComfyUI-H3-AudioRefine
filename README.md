@@ -63,7 +63,7 @@ steps vs 20), not per-step cost.
 ![Wiring the refine pass with the frozen video cache](examples/workflow.png)
 
 A ready-to-use graph is included:
-[`examples/mmh3_audio_refiner_basic_t2v.json`](examples/mmh3_audio_refiner_basic_t2v.json)
+[`example_workflow/mmh3_audio_refiner_basic_t2v.json`](example_workflow/mmh3_audio_refiner_basic_t2v.json)
 -- drag it into ComfyUI. It uses a couple of common utility nodes (math expression,
 resolution selector); if they show as missing, install them via ComfyUI Manager.
 
