@@ -12,7 +12,7 @@ For how the cache actually works internally -- the packed layout, the ComfyUI ho
 approximation, the cost model, and notes for modifying it -- see
 [TECHNICAL.md](TECHNICAL.md).
 
-Example output -- 1376x768, 30s, turbo pass followed by 6 audio-only refinement steps:
+Example output -- 1376x768, 10s, 4-step turbo pass natively, followed by 6 audio-only refinement steps with and without freezing the cache:
 
 https://github.com/user-attachments/assets/e62f5618-5be3-477f-aaff-dbb7844e8f1c
 
