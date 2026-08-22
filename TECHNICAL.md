@@ -49,7 +49,7 @@ those rows, so the returned video is bit-identical to the input.
 **But the cost does not go away.** Because attention is a single fused sequence, all
 37,000 frozen video rows still get their qkv projection, attention, and MLP at every one
 of the 50 blocks — full price — and the result is thrown away. Measured on an RTX 5090: a
-refinement step costs 20.7s against 24.0s for a full joint generation step. Freezing the
+refinement step costs 20.7s against 23.0s for a full joint generation step. Freezing the
 video saves almost nothing by itself.
 
 That video compute is not *pointless* — the audio rows attend to the video rows' K/V at
@@ -289,19 +289,19 @@ cached / full = 231.2M·n / (770M·n + 28672·n²)
 The `n²` term is attention, which nearly vanishes on cached steps because only the audio
 rows issue queries.
 
-Measured on an RTX 5090, 75,208 rows, 9.7 GB cache in RAM at `hidden`/`int4`:
+Measured on an RTX 5090, 75,216 rows, 9.7 GB cache in RAM at `hidden`/`int4`:
 
 | | steps | refinement pass | whole prompt |
 |---|---|---|---|
-| Turbo only, no refinement | 4 | — | 136.5s |
-| + refinement, cache bypassed | 4 + 6 | 124.0s (20.7s/step) | 264.9s |
-| + refinement, frozen cache | 4 + 6 | 45.7s (26.9s build, then 3.8s/step) | 185.8s |
+| Turbo only, no refinement | 4 | — | 137.3s |
+| + refinement, cache bypassed | 4 + 6 | 124.0s (20.7s/step) | 263.4s |
+| + refinement, frozen cache | 4 + 6 | 44.6s (26.5s build, then 3.6s/step) | 184.6s |
 
-3.8s / 20.7s ≈ **18%**, against a predicted 12%. The gap is cache streaming: ~9.7 GB moved
-from RAM to VRAM per step, plus dequantization. The model accounts for compute only.
+3.6s / 20.7s ≈ **17.6%**, against a predicted 12%. The gap is cache streaming: ~9.7 GB
+moved from RAM to VRAM per step, plus dequantization. The model accounts for compute only.
 
-The build costs about **30% more** than a normal step (26.9s vs 20.7s) — capturing and
-quantizing 50 blocks of state. Break-even is therefore around **1.4 refinement steps**, so
+The build costs about **28% more** than a normal step (26.5s vs 20.7s) — capturing and
+quantizing 50 blocks of state. Break-even is therefore around **1.3 refinement steps**, so
 the cache wins from 2 steps upward; the deciding question is available memory, not step
 count.
 

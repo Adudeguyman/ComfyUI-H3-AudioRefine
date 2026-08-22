@@ -69,29 +69,29 @@ uncond branch. The clip at the top of this README is the output of this graph.
 
 ### Measured
 
-Three runs of the same graph, from the console (a longer clip than the screenshot --
-75,208 packed rows, 9.7 GB cache at `hidden`/`int4` in system RAM):
+Three runs of the same graph, from the console (75,216 packed rows, 9.7 GB cache at
+`hidden`/`int4` in system RAM):
 
 | | steps | refinement pass | whole prompt |
 |---|---|---|---|
-| Turbo only, no refinement | 4 | -- | 136.5s |
-| + refinement, cache bypassed | 4 + 6 | 124.0s (20.7s/step) | 264.9s |
-| + refinement, frozen cache | 4 + 6 | 45.7s (26.9s build, then 3.8s/step) | 185.8s |
+| Turbo only, no refinement | 4 | -- | 137.3s |
+| + refinement, cache bypassed | 4 + 6 | 124.0s (20.7s/step) | 263.4s |
+| + refinement, frozen cache | 4 + 6 | 44.6s (26.5s build, then 3.6s/step) | 184.6s |
 
-So on this machine: **5.5x per cached step** (20.7s -> 3.8s), **2.7x on the refinement
+So on this machine: **5.7x per cached step** (20.7s -> 3.6s), **2.8x on the refinement
 pass** as a whole once the build is counted, and **1.4x on the end-to-end job** -- 79
-seconds saved on a 265-second render.
+seconds saved on a 263-second render.
 
 Two things worth reading out of that:
 
-- Building the cache costs about 30% more than a normal step (26.9s vs 20.7s), which is
+- Building the cache costs about 28% more than a normal step (26.5s vs 20.7s), which is
   the price of capturing and quantizing 50 blocks of frozen-row state.
-- Refinement steps are *not* free without the cache: 20.7s each, against 24.0s for a full
+- Refinement steps are *not* free without the cache: 20.7s each, against 23.0s for a full
   turbo step. Freezing the video saves almost nothing by itself, because the frozen rows
   still run through every block. That gap is the entire reason this cache exists.
 
-The `verbose` log shows where the time goes -- on cached steps here, `block loop 3.70s`
-of a `3.75s` model call, so essentially all of it is the transformer and almost none is
+The `verbose` log shows where the time goes -- on cached steps here, `block loop 3.59s`
+of a `3.65s` model call, so essentially all of it is the transformer and almost none is
 overhead.
 
 **These numbers are from one machine and are not a promise.** They were measured on an
@@ -129,7 +129,7 @@ Rough guidance:
   A refinement pass without it is slower but costs nothing beyond what generation already
   uses, and it is exact.
 - **You can spare the memory.** Use the cache from about 2 refinement steps upward. On the
-  measurements above the build pays for itself after roughly 1.4 steps, so even short
+  measurements above the build pays for itself after roughly 1.3 steps, so even short
   refinement runs come out ahead; longer ones come out far ahead.
 - **Not sure whether it is helping.** Turn on `verbose` and compare a run with the node
   bypassed against one with it active. The per-step log tells you where the time went
