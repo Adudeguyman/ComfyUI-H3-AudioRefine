@@ -757,12 +757,34 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                 pair = state.contents == "kv"
                 d_store = d_kv if pair else d_hidden
                 total = codec.nbytes(seq_len, d_store) * (2 if pair else 1) * n_blocks
+                # VRAM working set during cached steps, beyond the packed cache itself:
+                # kv     -> two full-seq dequant buffers
+                # hidden -> one dequant buffer + the transient full-seq qkv activation
+                if pair:
+                    working_vram = 2 * seq_len * d_kv * 2
+                else:
+                    working_vram = seq_len * d_hidden * 2 + seq_len * 3 * d_kv * 2
                 backend, why = _resolve_backend(state.backend, total, x[0].device,
                                                 allow_disk=state.allow_disk)
+                # Ask comfy's memory manager to make room *before* we allocate, so it
+                # evicts weights deliberately instead of colliding with an allocation
+                # it cannot see. The cache itself stays untracked; this only clears
+                # the runway at build time.
+                try:
+                    vram_needed = working_vram + (total if backend == "vram" else 0)
+                    comfy.model_management.free_memory(
+                        vram_needed + (1 << 30), x[0].device,
+                        ram_required=(total if backend == "ram" else 0))
+                except Exception as e:
+                    state.warn_once("free_memory",
+                                    "free_memory() request failed (%s); continuing, but "
+                                    "allocation may collide with resident weights." % e)
                 log.info("H3 Frozen Video Cache: building cache (%s) | rows=%d contents=%s "
-                         "dim=%d blocks=%d precision=%s size=%.1f GB backend=%s (%s)",
+                         "dim=%d blocks=%d precision=%s | packed %.1f GB in %s (%s) + "
+                         "%.1f GB VRAM working buffers | expect roughly %.1f GB total resident",
                          reason, seq_len, state.contents, d_store, n_blocks, state.precision,
-                         total / 2**30, backend, why)
+                         total / 2**30, backend, why, working_vram / 2**30,
+                         (total + working_vram) / 2**30)
                 if backend == "disk":
                     log.warning("H3 Frozen Video Cache: writing %.1f GB to disk for this cache "
                                 "build. Repeated runs cause real SSD wear -- see the disk wear "

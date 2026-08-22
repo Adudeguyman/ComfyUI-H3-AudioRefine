@@ -252,6 +252,18 @@ All implement `put` / `get` / `begin_step` / `end_step` / `free`.
 logs the choice and the reason. It will not fall through to disk unless `allow_disk` is
 on; it raises an error naming what did not fit instead.
 
+### Coexisting with comfy's memory manager
+
+The cache is invisible to ComfyUI's VRAM accounting. Left alone, that means comfy packs
+VRAM with resident weights and the cache allocation collides with them — CUDA OOM at
+build time. So before allocating, the wrapper calls
+`comfy.model_management.free_memory(vram_needed, device, ram_required=...)` with the
+working-set requirement (packed cache if the backend is `vram`, plus dequant buffers and
+the transient qkv activation either way), and comfy evicts weights to make room. Evicted
+weights stream back per step on demand — that is the dynamic loader's normal job — so the
+cost is transfer, not correctness. The request is best-effort and failure falls through
+with a warning rather than blocking the build.
+
 ### Memory reporting
 
 `MemAvailable` is a kernel *estimate* of what could be reclaimed under pressure, not a

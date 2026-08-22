@@ -197,6 +197,13 @@ is the honest baseline this approach has to beat.
 
 ## Changelog
 
+**1.0.1** (unreleased)
+- The node now asks comfy's `free_memory()` to make room before allocating the cache
+  (VRAM working buffers + packed cache for the vram backend, RAM for the ram backend),
+  so weights are evicted deliberately instead of colliding with an untracked allocation.
+- Build log reports the full expected resident footprint (packed + working buffers), not
+  just the packed size.
+
 - 1.0.0: Initial release. H3AudioRefineMask, H3AudioRefineSampler.
 
 ## H3 Frozen Video Cache
@@ -296,6 +303,14 @@ Every build also logs *why* it rebuilt (`no cache yet`, `video latent changed`,
 `conditioning changed`, `layout changed`, `refresh_interval reached`). If you see a build
 line on **every** step, the cache is never being reused and the pass is running slower
 than stock -- the reason field says what is invalidating it.
+
+**Coexisting with ComfyUI's memory manager:** the cache is not tracked by comfy's VRAM
+accounting, so before allocating, the node asks `free_memory()` to clear the room it
+needs -- comfy then evicts model weights deliberately instead of colliding with an
+allocation it cannot see. The build log reports the packed cache size, the VRAM working
+buffers on top of it, and the rough total resident footprint. If you still hit CUDA OOM
+with the cache in VRAM, `--vram-headroom 2` (or a bit more) tells comfy to keep that much
+VRAM free at all times, which gives eviction a head start.
 
 **Measured vs estimated memory:** every build logs what it predicted against what it
 actually cost:
