@@ -62,10 +62,18 @@ steps vs 20), not per-step cost.
 
 ![Wiring the refine pass with the frozen video cache](examples/workflow.png)
 
+A ready-to-use graph is included:
+[`examples/mmh3_audio_refiner_basic_t2v.json`](examples/mmh3_audio_refiner_basic_t2v.json)
+-- drag it into ComfyUI. It uses a couple of common utility nodes (math expression,
+resolution selector); if they show as missing, install them via ComfyUI Manager.
+
 `SamplerCustomAdvanced` runs the turbo pass; its LATENT goes to `H3 Audio Refine
-Sampler`, which takes its MODEL from `H3 Frozen Video Cache` (placed after the LoRA
-stack). `positive` is wired into `negative` as well, since `cfg 1.0` never evaluates the
-uncond branch. The clip at the top of this README is the output of this graph.
+Sampler`, which takes its MODEL from `H3 Frozen Video Cache`. Note the refine branch
+comes off the model *before* the turbo LoRA: pass 1 runs with the turbo LoRA, the
+refinement runs without it, so the extra audio steps use the undistilled weights -- the
+audio quality you were missing is exactly what the turbo LoRA took away. `positive` is
+wired into `negative` as well, since `cfg 1.0` never evaluates the uncond branch. The
+clip at the top of this README is the output of this graph.
 
 ### Measured
 
