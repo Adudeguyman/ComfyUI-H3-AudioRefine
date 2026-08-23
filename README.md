@@ -1,6 +1,6 @@
 # ComfyUI-H3-AudioRefine
 
-Audio-only refinement pass for MiniMax H3 packed AV latents. v1.0.0.
+Audio-only refinement pass for MiniMax H3 packed AV latents.
 
 Freeze the video stream of a sampled H3 latent (e.g. from a 4-step Turbo pass)
 and run additional denoising steps on the audio stream only. The intended use

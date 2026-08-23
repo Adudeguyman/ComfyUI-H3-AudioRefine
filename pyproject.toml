@@ -1,0 +1,16 @@
+[project]
+name = "comfyui-h3-audiorefine"
+description = "Audio-only refinement pass for MiniMax H3: freeze the video stream of a sampled latent and run extra denoising steps on the audio only, with an optional frozen-video KV cache that makes those steps several times cheaper."
+version = "1.0.2"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/Adudeguyman/ComfyUI-H3-AudioRefine"
+
+[tool.comfy]
+PublisherId = "adudeguyman"
+DisplayName = "ComfyUI-H3-AudioRefine"
+Icon = ""
+Tags = ["MiniMax H3", "audio", "video", "sampling", "performance"]
