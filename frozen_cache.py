@@ -133,6 +133,41 @@ class _CodecINT4:
 
 CODECS = {"bf16": _CodecBF16(), "fp8": _CodecFP8(), "int4": _CodecINT4()}
 
+# Quantize/dequantize in row chunks. The codecs materialise several fp32/int8
+# copies of their input at once; on a [150k, 5376] tensor that is ~5 GB of VRAM
+# transients stacked on top of the forward's own peak -- enough to OOM a build
+# whose cache payload lives in RAM. All codecs are row-independent, so chunking
+# is exact. ~16k rows caps the transient near 350 MB.
+QUANT_CHUNK_ROWS = 16384
+
+
+def _quantize_chunked(codec, t):
+    s = t.shape[0]
+    if s <= QUANT_CHUNK_ROWS:
+        return codec.quantize(t)
+    p_shape, p_dtype = codec.payload_shape(s, t.shape[1])
+    s_shape, s_dtype = codec.scales_shape(s, t.shape[1])
+    payload = torch.empty(p_shape, dtype=p_dtype, device=t.device)
+    scales = None if s_shape is None else torch.empty(s_shape, dtype=s_dtype, device=t.device)
+    for a in range(0, s, QUANT_CHUNK_ROWS):
+        b = min(a + QUANT_CHUNK_ROWS, s)
+        pq, ps = codec.quantize(t[a:b])
+        payload[a:b].copy_(pq)
+        if scales is not None:
+            scales[a:b].copy_(ps)
+    return payload, scales
+
+
+def _dequantize_chunked(codec, payload, scales, out, dtype):
+    s = payload.shape[0]
+    if s <= QUANT_CHUNK_ROWS:
+        return codec.dequantize(payload, scales, out, dtype)
+    for a in range(0, s, QUANT_CHUNK_ROWS):
+        b = min(a + QUANT_CHUNK_ROWS, s)
+        codec.dequantize(payload[a:b], None if scales is None else scales[a:b],
+                         out[a:b], dtype)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # storage backends
@@ -410,6 +445,22 @@ class _Slot:
     def free(self):
         if self.store is not None:
             backend = getattr(self.store, "name", "?")
+            if backend == "vram":
+                # RSS is host memory and never moves for a VRAM free; report the
+                # device allocator instead, or the log reads as "returned 0.0 GB".
+                try:
+                    v0 = torch.cuda.memory_allocated()
+                    self.store.free()
+                    self.dq_k = self.dq_v = self.dq_h = None
+                    torch.cuda.empty_cache()
+                    v1 = torch.cuda.memory_allocated()
+                    log.info("H3 Frozen Video Cache: cache freed (vram) | device allocated "
+                             "%s -> %s (returned %s)", _gb(v0), _gb(v1), _gb(max(v0 - v1, 0)))
+                except Exception:
+                    self.store.free()
+                self.store = None
+                self.dq_k = self.dq_v = self.dq_h = None
+                return
             rss0 = _rss_bytes()
             self.store.free()
             self.dq_k = self.dq_v = self.dq_h = None
@@ -429,9 +480,10 @@ class _Slot:
 
 class _State:
     def __init__(self, backend, precision, refresh_interval, contents="kv", verbose=False,
-                 allow_disk=False):
+                 allow_disk=False, vram_margin_gb=1.0):
         self.verbose = verbose
         self.allow_disk = allow_disk
+        self.vram_margin = int(vram_margin_gb * (1 << 30))
         self.backend = backend
         self.precision = precision
         self.refresh_interval = refresh_interval
@@ -494,6 +546,11 @@ def _fp_matches(a, b):
 # test and the room we ask comfy to clear.
 RAM_OVERHEAD_FACTOR = 1.5
 
+# comfy_kitchen's int8_linear allocates its output in fp32 (observed:
+# torch.empty((rows, ffn*2), dtype=out_dtype) asking 7.98 GiB at ~74.7k rows,
+# ffn*2 = 28672). Size activation estimates at 4 bytes/element accordingly.
+ACT_BYTES = 4
+
 _DISK_HELP = (
     "The disk backend is off by default because it writes the whole cache to your drive "
     "on every build -- gigabytes per run, which is real SSD wear. Enable the 'allow_disk' "
@@ -503,7 +560,7 @@ _DISK_HELP = (
 )
 
 
-def _resolve_backend(requested, total_bytes, device, allow_disk=False):
+def _resolve_backend(requested, total_bytes, device, allow_disk=False, transient_bytes=0):
     reasons = []
     if requested != "auto":
         if requested == "disk" and not allow_disk:
@@ -514,21 +571,34 @@ def _resolve_backend(requested, total_bytes, device, allow_disk=False):
         free_vram = comfy.model_management.get_free_memory(device)
     except Exception:
         free_vram = 0
-    if total_bytes + 4 * (1 << 30) < free_vram:
-        return "vram", "fits in free VRAM (%.1f GB free)" % (free_vram / 2**30)
-    reasons.append("VRAM: need %.1f GB + 4 GB margin, %.1f GB free" % (total_bytes / 2**30, free_vram / 2**30))
+    # The cache has to coexist with the transient activations of the step that is
+    # building it -- putting the cache in VRAM only works if BOTH fit.
+    vram_need = total_bytes + transient_bytes
+    if vram_need + 4 * (1 << 30) < free_vram:
+        return "vram", ("fits in free VRAM (%.1f GB cache + %.1f GB step activations, "
+                        "%.1f GB free)" % (total_bytes / 2**30, transient_bytes / 2**30,
+                                           free_vram / 2**30))
+    reasons.append("VRAM: need %.1f GB cache + %.1f GB step activations + 4 GB margin, "
+                   "%.1f GB free" % (total_bytes / 2**30, transient_bytes / 2**30,
+                                     free_vram / 2**30))
     ram = _meminfo_available_bytes()
     ram_need = int(total_bytes * RAM_OVERHEAD_FACTOR)
     if ram is not None and ram_need + 4 * (1 << 30) < ram:
         return "ram", ("fits in available system RAM (%.1f GB needed incl. overhead, "
                        "%.1f GB available)" % (ram_need / 2**30, ram / 2**30))
-    reasons.append("RAM: %.1f GB available" % ((ram or 0) / 2**30))
-    if not allow_disk:
-        raise RuntimeError(
-            "H3 Frozen Video Cache: the cache needs %.1f GB and does not fit in VRAM or "
-            "RAM (%s), and disk writing is not enabled. %s"
-            % (total_bytes / 2**30, "; ".join(reasons), _DISK_HELP))
-    return "disk", "; ".join(reasons)
+    reasons.append("RAM: %.1f GB needed incl. overhead, %.1f GB available"
+                   % (ram_need / 2**30, (ram or 0) / 2**30))
+    if allow_disk:
+        return "disk", "; ".join(reasons)
+    # Nothing cleanly fits by estimate. Proceed anyway on the ram backend: the
+    # allocations go to comfy's engine like any others, and if they truly cannot
+    # be satisfied the normal OOM surfaces at the allocation site. The node does
+    # not pre-empt the attempt -- estimates have been wrong before; the engine is
+    # the arbiter of what fits.
+    log.warning("H3 Frozen Video Cache: estimated fit is tight or negative (%s); "
+                "proceeding on the ram backend and letting ComfyUI manage it.",
+                "; ".join(reasons))
+    return "ram", "proceeding despite tight estimate; " + "; ".join(reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -567,13 +637,13 @@ def _block_build(state, blk, args):
 
     codec = state.slot.codec
     if state.contents == "hidden":
-        h_q, h_s = codec.quantize(h)
+        h_q, h_s = _quantize_chunked(codec, h)
         state.slot.store.put(i, h_q, h_s, None, None)
     q, k, v = _attn_qkv_rope(blk.attn, h, rope_freqs)
     s = h.shape[0]
     if state.contents == "kv":
-        k_q, k_s = codec.quantize(k.reshape(s, -1))
-        v_q, v_s = codec.quantize(v.reshape(s, -1))
+        k_q, k_s = _quantize_chunked(codec, k.reshape(s, -1))
+        v_q, v_s = _quantize_chunked(codec, v.reshape(s, -1))
         state.slot.store.put(i, k_q, k_s, v_q, v_s)
 
     vq = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
@@ -609,7 +679,7 @@ def _block_cached(state, blk, args):
     if state.contents == "hidden":
         # rebuild K/V on the fly from the stored post-norm hidden states
         h_q, h_s, _, _ = slot.store.get(i, x.device)
-        codec.dequantize(h_q, h_s, slot.dq_h, x.dtype)
+        _dequantize_chunked(codec, h_q, h_s, slot.dq_h, x.dtype)
         h_a = mm_h3._mod_scale_shift(blk.norm1(xa), shift_msa, scale_msa, seg)
         slot.dq_h[aa:ab] = h_a.to(slot.dq_h.dtype)
         q_full, kf, vf = _attn_qkv_rope(blk.attn, slot.dq_h, rope_freqs)
@@ -621,8 +691,8 @@ def _block_cached(state, blk, args):
 
         # cached K/V for the whole sequence, live audio slice patched in
         k_q, k_s, v_q, v_s = slot.store.get(i, x.device)
-        codec.dequantize(k_q, k_s, slot.dq_k, x.dtype)
-        codec.dequantize(v_q, v_s, slot.dq_v, x.dtype)
+        _dequantize_chunked(codec, k_q, k_s, slot.dq_k, x.dtype)
+        _dequantize_chunked(codec, v_q, v_s, slot.dq_v, x.dtype)
         kf = slot.dq_k.view(slot.seq_len, heads, hd)
         vf = slot.dq_v.view(slot.seq_len, heads, hd)
         kf[aa:ab] = k_live.to(kf.dtype)
@@ -703,7 +773,26 @@ def make_block_replace(state, get_block, n_blocks):
     return block_replace
 
 
-def make_wrapper(state, n_blocks, d_kv, d_hidden):
+def _working_vram_bytes(contents, seq_len, d_kv, d_hidden):
+    """VRAM needed during cached steps beyond the packed cache itself:
+    kv     -> two full-seq dequant buffers
+    hidden -> one dequant buffer + the transient full-seq qkv activation
+              (fp32 out of int8_linear, hence ACT_BYTES)"""
+    if contents == "kv":
+        return 2 * seq_len * d_kv * 2
+    return seq_len * d_hidden * 2 + seq_len * 3 * d_kv * ACT_BYTES
+
+
+def _build_peak_bytes(seq_len, d_ffn2):
+    """Peak transient VRAM of a *full* forward -- what the build step costs, and
+    what a stock (uncached) step costs. Dominated by the MLP intermediate:
+    fc1 emits [seq_len, ffn*2] in fp32. This is not the cache; it is the work the
+    build has to do anyway, and it must be counted or the cache allocation leaves
+    no room for it."""
+    return seq_len * d_ffn2 * ACT_BYTES
+
+
+def make_wrapper(state, n_blocks, d_kv, d_hidden, d_ffn2):
     def wrapper(executor, x, timestep, context, transformer_options={}, **kwargs):
         state.mode = "off"
         state.step_ctx = {}
@@ -765,38 +854,31 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                 pair = state.contents == "kv"
                 d_store = d_kv if pair else d_hidden
                 total = codec.nbytes(seq_len, d_store) * (2 if pair else 1) * n_blocks
-                # VRAM working set during cached steps, beyond the packed cache itself:
-                # kv     -> two full-seq dequant buffers
-                # hidden -> one dequant buffer + the transient full-seq qkv activation
-                if pair:
-                    working_vram = 2 * seq_len * d_kv * 2
-                else:
-                    working_vram = seq_len * d_hidden * 2 + seq_len * 3 * d_kv * 2
-                backend, why = _resolve_backend(state.backend, total, x[0].device,
-                                                allow_disk=state.allow_disk)
-                # Ask comfy's memory manager to make room *before* we allocate, so it
-                # evicts weights deliberately instead of colliding with an allocation
-                # it cannot see. The cache itself stays untracked; this only clears
-                # the runway at build time.
+                working_vram = _working_vram_bytes(state.contents, seq_len, d_kv, d_hidden)
+                build_peak = _build_peak_bytes(seq_len, d_ffn2)
+                # Ask comfy to make room BEFORE any fit test: get_free_memory()
+                # reports what is free right now, not what comfy could free by
+                # evicting, so measuring first understates what is obtainable.
+                # The request goes through comfy's own engine; the engine decides.
                 try:
-                    vram_needed = working_vram + (total if backend == "vram" else 0)
-                    ram_ask = int(total * RAM_OVERHEAD_FACTOR) if backend == "ram" else 0
-                    # pins_required routes into comfy's pin budget: it frees comfy's own
-                    # pinned staged weights against measured available RAM, which is the
-                    # RAM-side equivalent of the VRAM eviction above.
+                    ram_ask = int(total * RAM_OVERHEAD_FACTOR)
                     comfy.model_management.free_memory(
-                        vram_needed + (1 << 30), x[0].device,
-                        pins_required=ram_ask, ram_required=ram_ask)
+                        build_peak + state.vram_margin +
+                        (total if state.backend in ("auto", "vram") else 0),
+                        x[0].device, pins_required=ram_ask, ram_required=ram_ask)
                 except Exception as e:
                     state.warn_once("free_memory",
                                     "free_memory() request failed (%s); continuing, but "
                                     "allocation may collide with resident weights." % e)
+                backend, why = _resolve_backend(state.backend, total, x[0].device,
+                                                allow_disk=state.allow_disk,
+                                                transient_bytes=build_peak)
                 log.info("H3 Frozen Video Cache: building cache (%s) | rows=%d contents=%s "
-                         "dim=%d blocks=%d precision=%s | packed %.1f GB in %s (%s) + "
-                         "%.1f GB VRAM working buffers | expect roughly %.1f GB total resident",
+                         "dim=%d blocks=%d precision=%s | packed %.1f GB in %s (%s) | "
+                         "build step needs ~%.1f GB transient VRAM, cached steps ~%.1f GB",
                          reason, seq_len, state.contents, d_store, n_blocks, state.precision,
-                         total / 2**30, backend, why, working_vram / 2**30,
-                         (total + working_vram) / 2**30)
+                         total / 2**30, backend, why, build_peak / 2**30,
+                         working_vram / 2**30)
                 if backend == "ram":
                     log.info("H3 Frozen Video Cache: expect ~%.1f GB host RAM resident for the "
                              "%.1f GB packed cache (measured ~%.1fx allocator/pinning overhead)",
@@ -818,6 +900,19 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
                 if new_step:
                     slot.steps_since_build += 1
                 state.mode = "cached"
+                # Comfy's picture of free VRAM has moved since the build (weights
+                # stream back in between our calls), and our working buffers +
+                # attention transients are invisible to it. Re-announce the need
+                # on every cached call so its accounting is accurate at the moment
+                # it matters. Cheap no-op when the room already exists.
+                try:
+                    working_vram = _working_vram_bytes(state.contents, slot.seq_len,
+                                                       d_kv, d_hidden)
+                    comfy.model_management.free_memory(
+                        working_vram + state.vram_margin, x[0].device)
+                except Exception as e:
+                    state.warn_once("free_memory_step",
+                                    "per-step free_memory() failed (%s); continuing." % e)
 
             state.slot = slot
             state.step_ctx = {"block_index": 0}
@@ -830,6 +925,12 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden):
             finally:
                 if state.mode == "cached" and slot.store is not None:
                     slot.store.end_step()
+                # Drop the dequant buffers between calls: torch's caching allocator
+                # makes the freed VRAM immediately reusable by comfy's own
+                # allocations (weights, VAE), and re-allocating next step from the
+                # same pool is near-free. ~4 GB returned to the ecosystem while we
+                # are not actively inside a step.
+                slot.dq_k = slot.dq_v = slot.dq_h = None
             if state.mode == "build":
                 # stamp validity only after the build completed every block
                 slot.layout_sig = sig
@@ -892,7 +993,7 @@ def check_core_compat(dm):
 
 
 def patch_model(model, backend, precision, refresh_interval, cache_contents="kv", verbose=False,
-                allow_disk=False, enabled=True):
+                allow_disk=False, enabled=True, vram_margin_gb=1.0):
     if not enabled:
         # Return the model untouched: no wrapper, no block patches, no compat check.
         # Identical to bypassing the node, but keeps the graph wiring intact.
@@ -908,13 +1009,17 @@ def patch_model(model, backend, precision, refresh_interval, cache_contents="kv"
     d_hidden = getattr(dm, "hidden_size", None)
     if d_hidden is None:
         d_hidden = dm.blocks[0].norm1.weight.shape[0]
+    fc1 = dm.blocks[0].mlp.fc1
+    d_ffn2 = getattr(fc1, "out_features", None)
+    if d_ffn2 is None:
+        d_ffn2 = fc1.weight.shape[0]
 
     m = model.clone()
     state = _State(backend, precision, refresh_interval, cache_contents, verbose=verbose,
-                   allow_disk=allow_disk)
+                   allow_disk=allow_disk, vram_margin_gb=vram_margin_gb)
     replace = make_block_replace(state, lambda i: dm.blocks[i], n_blocks)
     for i in range(n_blocks):
         m.set_model_patch_replace(replace, "dit", "double_block", i)
     m.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
-                           make_wrapper(state, n_blocks, d_kv, d_hidden))
+                           make_wrapper(state, n_blocks, d_kv, d_hidden, d_ffn2))
     return m

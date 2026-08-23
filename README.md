@@ -205,7 +205,7 @@ is the honest baseline this approach has to beat.
 
 ## Changelog
 
-**1.0.1** (unreleased)
+**1.0.2**
 - The node now asks comfy's `free_memory()` to make room before allocating the cache
   (VRAM working buffers + packed cache for the vram backend, RAM for the ram backend),
   so weights are evicted deliberately instead of colliding with an untracked allocation.
@@ -213,6 +213,15 @@ is the honest baseline this approach has to beat.
   just the packed size.
 - RAM backend now requests comfy's pin budget (freeing comfy's own pinned staging) sized
   at a measured 1.5x overhead factor, and auto's RAM fit test uses the same factor.
+- The VRAM room request is repeated on every cached step, not just at build, and the
+  dequant working buffers are released between calls (~4 GB back to comfy's pool).
+- New `vram_margin_gb` input (appended last; default 1.0): extra VRAM added to every
+  room request, for when the estimate undershoots on a given clip.
+- Backend selection and room requests now account for the transient activations of the
+  step itself (the full-forward MLP intermediate at build time, ~8 GB at 75k rows), sized
+  in fp32 to match what `int8_linear` actually allocates. `auto` no longer picks VRAM for
+  a cache that fits on its own but leaves no room for the forward building it.
+- VRAM frees now report device memory instead of host RSS.
 
 - 1.0.0: Initial release. H3AudioRefineMask, H3AudioRefineSampler.
 
@@ -269,8 +278,11 @@ anywhere.
   error, not a silent downgrade. Disk caches live under the ComfyUI temp directory and are
   deleted when replaced.
 - `allow_disk` — off by default. See the disk wear warning at the top of this README.
-Cache size is printed on every build **before** allocation. Approximate sizes at
-1344×768 / 124 frames (~38k rows, 50 blocks), by contents x precision:
+Cache size is printed on every build **before** allocation, and that log line is the
+authoritative number. It scales **linearly with clip length and resolution**: at
+1344×768 / 24fps, `hidden`/`int4` costs roughly **1 GB per second of clip** (135 KB per
+packed row across the 50 blocks); `kv` is 2.7x that; `fp8` doubles and `bf16` quadruples
+any cell. For one worked example -- a ~5.2s clip at 1344×768 (~38k rows):
 
 | | `bf16` | `fp8` | `int4` |
 |---|---|---|---|
@@ -324,9 +336,20 @@ host allocation, not the optimistic packed size -- which makes comfy free its ow
 staged weights against actually-available RAM. The auto-backend fit test uses the same
 1.5x figure, so `auto` no longer chooses RAM on headroom that would not survive the
 allocation. The build log reports the packed cache size, the VRAM working
-buffers on top of it, and the rough total resident footprint. If you still hit CUDA OOM
-with the cache in VRAM, `--vram-headroom 2` (or a bit more) tells comfy to keep that much
-VRAM free at all times, which gives eviction a head start.
+buffers on top of it, and the rough total resident footprint. The request is repeated on every
+cached step (comfy's picture of free VRAM moves between our calls as weights stream back
+in), and the dequant working buffers are released between calls so comfy's own
+allocations can use that VRAM while a step is not running. If you still hit CUDA OOM
+during refinement, raise `vram_margin_gb` on the node -- it is added to every room
+request, making comfy evict more before the cache allocates. No launch flags needed.
+
+**Why `auto` may refuse VRAM even when the cache would fit.** The cache has to coexist
+with the transient activations of the step running alongside it. Those are large at high
+row counts: the MLP intermediate alone is `rows x ffn*2` in fp32 -- about **8 GB at ~75k
+rows** -- and the build step runs a full forward, so it pays that in full. A 10 GB cache
+plus an 8 GB transient plus ~16 GB of resident int8 weights does not fit in 32 GB, so
+`auto` picks `ram` instead and says so in the log. Forcing `backend: vram` at that size
+will OOM inside the build.
 
 **Measured vs estimated memory:** every build logs what it predicted against what it
 actually cost:

@@ -204,11 +204,13 @@ class H3FrozenVideoCache:
                                "for A/B timing against a cached run."}),
                 "cache_contents": (["hidden", "kv"], {
                     "default": "hidden",
-                    "tooltip": "What to cache per block for the frozen rows. hidden: post-norm hidden "
-                               "states (~2.7x smaller: ~5.3 GB int4 at full canvas), K/V rebuilt on the "
-                               "fly each step (~30% of video compute remains; ~3x faster cached steps). "
-                               "kv: post-rope K/V directly (~14 GB int4), cached steps nearly free -- "
-                               "needs the RAM/VRAM to hold it."}),
+                    "tooltip": "What to cache per block for the frozen rows. Size scales linearly with "
+                               "clip length and resolution -- at 1344x768/24fps, int4 costs roughly "
+                               "1 GB per SECOND of clip for hidden, ~2.7 GB/s for kv. hidden: post-norm "
+                               "hidden states, K/V rebuilt on the fly each step (~30% of video compute "
+                               "remains; ~3x faster cached steps). kv: post-rope K/V directly, cached "
+                               "steps nearly free but 2.7x bigger. The exact size is printed to the "
+                               "console before every build."}),
                 "backend": (["auto", "vram", "ram", "disk"], {
                     "default": "auto",
                     "tooltip": "Where the cache lives. auto picks the first of vram/ram/disk that fits "
@@ -216,7 +218,8 @@ class H3FrozenVideoCache:
                 "precision": (["int4", "fp8", "bf16"], {
                     "default": "int4",
                     "tooltip": "Cache storage precision. int4 (group-128) is smallest and fastest to "
-                               "stream (~14 GB at full canvas); fp8 ~27 GB; bf16 ~55 GB, exact."}),
+                               "stream; fp8 is 2x int4; bf16 is 4x int4, exact. See cache_contents for "
+                               "the per-second sizing rule; the exact size is printed before every build."}),
                 "refresh_interval": ("INT", {
                     "default": 0, "min": 0, "max": 100,
                     "tooltip": "Rebuild the cache every N refinement steps (each rebuild costs one "
@@ -235,15 +238,23 @@ class H3FrozenVideoCache:
                                "build, which is significant SSD wear over repeated runs. With this "
                                "off, the node raises a clear error instead of falling back to disk "
                                "when the cache does not fit in VRAM or RAM."}),
+                "vram_margin_gb": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 16.0, "step": 0.5,
+                    "tooltip": "Extra VRAM (GB) added to every room request made to comfy's "
+                               "memory manager, at build time and on each cached step. Raise "
+                               "this if you hit CUDA OOM during refinement -- it makes comfy "
+                               "evict more weights before the cache and its working buffers "
+                               "allocate."}),
             },
         }
 
     def patch(self, model, enabled, cache_contents, backend, precision, refresh_interval,
-              verbose=False, allow_disk=False):
+              verbose=False, allow_disk=False, vram_margin_gb=1.0):
         from . import frozen_cache
         return (frozen_cache.patch_model(model, backend, precision, refresh_interval,
                                          cache_contents=cache_contents, verbose=verbose,
-                                         allow_disk=allow_disk, enabled=enabled),)
+                                         allow_disk=allow_disk, enabled=enabled,
+                                         vram_margin_gb=vram_margin_gb),)
 
 
 NODE_CLASS_MAPPINGS = {

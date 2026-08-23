@@ -262,7 +262,21 @@ working-set requirement (packed cache if the backend is `vram`, plus dequant buf
 the transient qkv activation either way), and comfy evicts weights to make room. Evicted
 weights stream back per step on demand — that is the dynamic loader's normal job — so the
 cost is transfer, not correctness. The request is best-effort and failure falls through
-with a warning rather than blocking the build.
+with a warning rather than blocking the build. It is also *repeated on every cached
+call*, not just at build: comfy's free-VRAM picture moves between our calls as evicted
+weights stream back in, and the working buffers plus attention transients are invisible
+to it, so the need is re-announced at the moment it matters (a cheap no-op when room
+already exists). Symmetrically, the dequant buffers are dropped at the end of every
+activated call -- torch's caching allocator makes that VRAM immediately reusable by
+comfy's own allocations, and re-allocation next step from the same pool is near-free.
+`vram_margin_gb` is added to every request for clips where the estimate undershoots.
+
+Crucially the request and the `auto` fit test both include the *transient* peak of the
+step the cache coexists with, not just the packed cache. `comfy_kitchen`'s `int8_linear`
+allocates its output in fp32, so the MLP intermediate is `rows x ffn*2 x 4` -- about 8 GB
+at 75k rows -- and the build step runs a full forward and pays it in full. Ignoring that
+term is what produced OOM inside `_block_build`'s `blk.mlp(h)`: the cache had been placed
+in VRAM on the strength of its own size alone.
 
 The same coordination exists on the host side. `free_memory(pins_required=N)` routes into
 `ensure_pin_budget()`, which computes the shortfall against measured available RAM (with a
