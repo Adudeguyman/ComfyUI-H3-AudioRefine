@@ -16,6 +16,21 @@ Example output -- 1376x768, 10s, 4-step turbo pass natively, followed by 6 audio
 
 https://github.com/user-attachments/assets/e62f5618-5be3-477f-aaff-dbb7844e8f1c
 
+## Install
+
+**ComfyUI Manager** (recommended): open Manager, search for `ComfyUI-H3-AudioRefine`,
+click Install, restart ComfyUI.
+
+**Manual**: clone into your `custom_nodes` directory and restart ComfyUI.
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/Adudeguyman/ComfyUI-H3-AudioRefine.git
+```
+
+There are no Python dependencies to install -- the pack uses only torch, numpy, and
+ComfyUI's own internals.
+
 ## How it works
 
 ComfyUI's native MiniMax H3 support already contains a masked-inpaint path for
@@ -72,8 +87,9 @@ Sampler`, which takes its MODEL from `H3 Frozen Video Cache`. Note the refine br
 comes off the model *before* the turbo LoRA: pass 1 runs with the turbo LoRA, the
 refinement runs without it, so the extra audio steps use the undistilled weights -- the
 audio quality you were missing is exactly what the turbo LoRA took away. `positive` is
-wired into `negative` as well, since `cfg 1.0` never evaluates the uncond branch. The
-clip at the top of this README is the output of this graph.
+wired into `negative` as well: H3 is a distilled model that runs at cfg 1.0, so the
+uncond branch is never evaluated and the negative input is unused. The clip at the top of
+this README is the output of this graph.
 
 ### Measured
 
@@ -90,13 +106,26 @@ So on this machine: **5.7x per cached step** (20.7s -> 3.6s), **2.8x on the refi
 pass** as a whole once the build is counted, and **1.4x on the end-to-end job** -- 79
 seconds saved on a 263-second render.
 
-Two things worth reading out of that:
+**Only the first refinement step builds the cache.** So you will notice that first step
+taking an additional few seconds compared to a normal step (26.5s vs 20.7s), because the
+cache is built AND the first audio denoise step is processed. Every step after it reads
+the cache instead of recomputing, and drops to 3.6s (or longer depending on target
+generation length). So a 6-step refinement is one 26.5s step followed by five at 3.6s,
+not six expensive ones:
 
-- Building the cache costs about 28% more than a normal step (26.5s vs 20.7s), which is
-  the price of capturing and quantizing 50 blocks of frozen-row state.
-- Refinement steps are *not* free without the cache: 20.7s each, against 23.0s for a full
-  turbo step. Freezing the video saves almost nothing by itself, because the frozen rows
-  still run through every block. That gap is the entire reason this cache exists.
+```
+without cache   20.7 + 20.7 + 20.7 + 20.7 + 20.7 + 20.7  = 124.0s
+with cache      26.5 +  3.6 +  3.6 +  3.6 +  3.6 +  3.6  =  44.6s
+                 ^^^^ builds the cache
+```
+
+The more refinement steps you run, the more the one expensive step is diluted -- it pays
+for itself after roughly 1.3 steps.
+
+Worth noting too: refinement steps are *not* free without the cache. At 20.7s each
+against 23.0s for a full turbo step, freezing the video saves almost nothing by itself,
+because the frozen rows still run through every block. That gap is the entire reason this
+cache exists.
 
 The `verbose` log shows where the time goes -- on cached steps here, `block loop 3.59s`
 of a `3.65s` model call, so essentially all of it is the transformer and almost none is
@@ -176,8 +205,8 @@ refinement pass instead of freezing it exactly.
 ## Suggested starting point (Turbo 4-step)
 
 1. Pass 1: your existing 4-step Turbo graph, unchanged.
-2. H3 Audio Refine Sampler: steps 4-6, audio_denoise 0.5, cfg 1.0,
-   euler / simple, same model+LoRA and conditioning as pass 1.
+2. H3 Audio Refine Sampler: steps 4-6, audio_denoise 0.5, euler / simple, same
+   conditioning as pass 1, and the model branched off *before* the Turbo LoRA.
 3. Decode as usual.
 
 A/B against a straight 6-8 step Turbo run at matched total step count -- that
@@ -192,12 +221,63 @@ is the honest baseline this approach has to beat.
 - No extra Python dependencies. No monkeypatching: only public
   `comfy.sample` / `noise_mask` APIs are used.
 
+### Startup flags worth knowing about (NVIDIA)
+
+**There is a known CUDA driver bug in ComfyUI's dynamic VRAM streaming.** ComfyUI
+maintainers have reported it to NVIDIA and documented two flags that work around it --
+`--cuda-device 0` (or a higher index) to restrict ComfyUI to a single GPU, and
+`--disable-pinned-memory`. See
+[ComfyUI issue #15255](https://github.com/Comfy-Org/ComfyUI/issues/15255).
+
+They are listed there as alternatives, but they address different things and **running
+both together works well** on a single-GPU machine:
+
+```
+python main.py --cuda-device 0 --disable-pinned-memory
+```
+
+Use `--disable-pinned-memory` on its own only if you need more than one GPU visible,
+since `--cuda-device` hides the others.
+
+OOM errors have been reported while using this pack that trace back to that bug rather
+than to the cache. A refinement pass moves a lot of data between system RAM and the GPU,
+which makes it a good way to run into it. **If you hit OOM here, try these flags before
+assuming the cache is at fault** -- neither is required, and neither is specific to this
+pack.
+
+`--disable-pinned-memory`
+
+ComfyUI normally uses *pinned* (page-locked) system memory to move model weights to the
+GPU faster. Pinned pages cannot be swapped out by the OS, and allocating them is slow and
+requires contiguous physical memory. On some setups that backfires: allocations fail or
+crash inside CUDA even though there appears to be free memory, particularly at higher
+resolutions or when system RAM is already committed. Users have hit this with WSL, GGUF
+loaders and heavy VRAM offloading, and disabling the feature resolved it. Transfers get
+somewhat slower, but the failures go away. This is also the workaround to use instead of
+`--cuda-device` if you need more than one GPU visible.
+
+`--cuda-device 0`
+
+Restricts ComfyUI to a single GPU. Users report this improving memory behaviour **even on
+single-GPU machines**. The likely reason: it makes that card the only *visible* device, so
+nothing in the stack has to reason about other adapters -- integrated graphics, a headless
+second adapter, or a container runtime -- when allocating and streaming. It also makes the
+memory numbers in the logs unambiguous.
+
+Harmless on a single-GPU box, and worth trying alongside `--disable-pinned-memory` if
+refinement passes are crashing. On a multi-GPU machine, set the index of the card you
+actually want rather than assuming `0`.
+
 ## Notes / limits
 
-- Refining with a different model stack than pass 1 (e.g. dropping the Turbo
-  LoRA for the refinement pass) is allowed by the graph and worth testing,
-  but is untested territory: the base model at 4-6 tail steps may fight the
-  distilled trajectory the audio was started on.
+- Taking the refinement branch off the model **before** the Turbo LoRA is the
+  recommended setup, and it is what the example workflow does. Pass 1 gets
+  turbo's speed for the video; the refinement steps run on undistilled weights,
+  so the audio quality the LoRA cost you is what the extra steps recover. This
+  is not a risky configuration: the refine pass builds its own sigma schedule
+  rather than continuing pass 1's, so the base model denoises from a
+  partially-noised latent in the ordinary way, and the frozen video conditions
+  it identically regardless of which weights produced it.
 - `latent` must be a sampled H3 AV latent (nested video+audio). Plain latents
   are rejected with a clear error.
 - Conditioning with keyframes/refs is passed through untouched; the frozen
