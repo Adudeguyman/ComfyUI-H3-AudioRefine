@@ -232,28 +232,20 @@ class _StoreRAM:
         self.k = [None] * n_blocks
         self.v = [None] * n_blocks
 
-    _pin_failed = False
-
-    @classmethod
-    def _pin(cls, t):
+    @staticmethod
+    def _copy_to_ram(t):
         if t is None:
             return None
-        pin = torch.cuda.is_available() and not cls._pin_failed
-        try:
-            c = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=pin)
-        except RuntimeError:
-            if not cls._pin_failed:
-                cls._pin_failed = True
-                log.warning("H3 Frozen Video Cache: could not pin cache memory (RAM pressure); "
-                            "falling back to pageable memory. Cached steps will be slightly "
-                            "slower but the cache can be swapped instead of killing the process.")
-            c = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=False)
+        # Keep the persistent cache pageable. PyTorch's pinned-host caching allocator
+        # retains freed blocks for the lifetime of the process; repeated H3 cache
+        # rebuilds with different shapes otherwise leave tens of GiB resident.
+        c = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=False)
         c.copy_(t)
         return c
 
     def put(self, i, k_q, k_s, v_q, v_s):
-        self.k[i] = (self._pin(k_q), self._pin(k_s))
-        self.v[i] = (self._pin(v_q), self._pin(v_s))
+        self.k[i] = (self._copy_to_ram(k_q), self._copy_to_ram(k_s))
+        self.v[i] = (self._copy_to_ram(v_q), self._copy_to_ram(v_s))
 
     def get(self, i, device):
         k_q, k_s = self.k[i]
@@ -467,13 +459,8 @@ class _Slot:
             rss1 = _rss_bytes()
             if rss0 is not None and rss1 is not None:
                 returned = rss0 - rss1
-                note = ""
-                if backend == "ram" and returned < 0.5 * (rss0 - rss1 + 1):
-                    note = (" -- pinned host memory is held by PyTorch's caching host "
-                            "allocator and is not returned to the OS; it is reused by the "
-                            "next build rather than released")
                 log.info("H3 Frozen Video Cache: cache freed (%s) | process RSS %s -> %s "
-                         "(returned %s)%s", backend, _gb(rss0), _gb(rss1), _gb(max(returned, 0)), note)
+                         "(returned %s)", backend, _gb(rss0), _gb(rss1), _gb(max(returned, 0)))
         self.store = None
         self.dq_k = self.dq_v = self.dq_h = None
 
