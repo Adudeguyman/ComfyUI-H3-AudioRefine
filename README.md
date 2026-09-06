@@ -223,6 +223,11 @@ is the honest baseline this approach has to beat.
 
 ### Startup flags worth knowing about (NVIDIA)
 
+If you are on ComfyUI 0.34 or newer and see `aimdo memory compile error`, update this
+pack -- 1.0.3 handles it by disabling the model compiler for the refinement pass only.
+`--disable-comfy-compiler` disables it globally, which is also worth trying if 0.34 made
+your normal generation slower.
+
 **There is a known CUDA driver bug in ComfyUI's dynamic VRAM streaming.** ComfyUI
 maintainers have reported it to NVIDIA and documented two flags that work around it --
 `--cuda-device 0` (or a higher index) to restrict ComfyUI to a single GPU, and
@@ -284,6 +289,28 @@ actually want rather than assuming `0`.
   video mask stacks with them via the native pooled-mask path.
 
 ## Changelog
+
+**1.0.3**
+- The RAM backend now keeps the cache in pageable host memory instead of pinned. Pinned
+  blocks are retained by PyTorch's caching host allocator for the life of the process and
+  are not reused across rebuilds of differing shape, which leaked tens of GiB over a
+  session. Thanks to @gabxav (PR #1).
+- RAM sizing recalibrated for that change: the host footprint is now ~1.0x the packed
+  cache (measured 20.6 GB packed -> 20.0 GB RSS), so the overhead factor drops from 1.5 to
+  1.1. The old value made `auto` demand ~11 GB more than a 20 GB cache actually needs and
+  refuse RAM unnecessarily. The build log now prints `actual/estimated` so the factor can
+  be checked against your own runs.
+- ComfyUI 0.34 compatibility: from 0.34 the DiT forward is recorded into an aimdo
+  "malloc graph" by the Comfy model compiler, which assumes a repeatable allocation
+  pattern. This cache is the opposite (a multi-GB build allocation, eviction requests
+  mid-forward, a different shape again on cached steps), so it surfaced as
+  `RuntimeError: aimdo memory compile error`. The node now switches the model compiler
+  off for the duration of sampling on its own model -- the same thing
+  `--disable-comfy-compiler` does globally -- and restores the setting afterwards,
+  including on error. No effect on older ComfyUI, and a user-supplied
+  `--disable-comfy-compiler` is left alone.
+- New `free_after_pass` input (appended last; default off): release the cache when the
+  sampling run ends instead of holding it for a possible warm re-queue.
 
 **1.0.2**
 - The node now asks comfy's `free_memory()` to make room before allocating the cache
@@ -377,9 +404,8 @@ Sizes scale linearly with row count.
   qkv activation (~1.6 GB peak).
 - The disk backend stages through two double-buffered pinned blocks (~0.5 GB RAM for
   `kv`/int4, ~0.2 GB for `hidden`/int4).
-- If pinned allocation fails under RAM pressure, the RAM backend falls back to pageable
-  memory with a console warning (slightly slower transfers, but the cache can swap
-  instead of the process being killed).
+- The RAM backend uses pageable host memory, so a freed cache is actually returned to the
+  OS (see the note on pinned-allocator retention below).
 
 **Precision** (`precision` input): `int4` (group-128 symmetric; default — smallest and
 fastest to stream), `fp8` (per-row scaled e4m3), `bf16` (exact). Verified cached-step
@@ -443,11 +469,21 @@ could be reclaimed under pressure, not a measurement -- it counts reclaimable pa
 and slab, so it reads optimistically. `process RSS` is what the cache really cost. If
 those two disagree badly on your machine, trust RSS.
 
-Note that on the `ram` backend the memory is **pinned**, and PyTorch keeps freed pinned
-blocks in its caching host allocator rather than returning them to the OS. So RSS stays
-elevated after the cache is freed. That memory is reused by the next build, but the OS
-does not get it back for the life of the process -- the free log says so explicitly when
-it happens.
+The `ram` backend keeps the cache in **pageable** host memory, so freeing it actually
+returns the memory to the OS. It previously used pinned (page-locked) memory for faster
+transfers, but PyTorch's pinned-host caching allocator retains freed blocks for the life
+of the process -- and since each rebuild at a different resolution or clip length asks for
+different block sizes, those blocks are never reused either. That leaked tens of GiB
+across a session. Pageable transfers are somewhat slower; predictable release is worth
+more. (Fix contributed by @gabxav, PR #1.)
+
+**`free_after_pass`** releases the cache the moment a sampling run ends rather than
+holding it for the next one. Default off, which keeps the current behaviour: re-queueing
+the *same* pass-1 latent then skips the rebuild. Note that a randomized seed invalidates
+the cache anyway, so if you randomize between runs you are holding several GB between
+generations for a warm start you will not get -- turn this on. The cost is one full-price
+build step on every run. It hooks ComfyUI's `OUTER_SAMPLE` wrapper, so it also fires on
+error and on interrupt, which is when releasing the memory matters most.
 
 **Lifecycle:** the cache persists across queue runs on purpose (re-queueing the same
 refine skips the rebuild) and is invalidated automatically by a new video latent (new

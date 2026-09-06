@@ -131,6 +131,27 @@ for i, block in enumerate(self.blocks):
 `patch_model()` registers a replacement for all 50 blocks via
 `ModelPatcher.set_model_patch_replace(..., "dit", "double_block", i)`.
 
+**The 0.34 malloc graph.** From ComfyUI 0.34, `MiniMaxH3.forward` brackets the whole DiT
+in `comfy.model_prefetch.malloc_graph_begin/end`, and each block calls
+`prefetch_queue_pop(..., malloc_scope="block")`, pushing and popping named scopes on an
+aimdo allocation recorder that assumes a repeatable pattern. This node breaks that by
+design: the build step allocates gigabytes and evicts models mid-forward, and cached
+steps allocate a different shape again.
+
+Pausing the recorder (`graph.pause()`, the mechanism core uses for its BLAS workspaces)
+is **not** sufficient here. Pausing the whole forward means nothing is recorded between
+`begin` and `end`, and `malloc_graph_end`'s `graph.pop()` then fails itself -- the error
+simply moves from `push` to `pop`. Pausing only our own allocations leaves core's block
+allocations recorded against a pattern that changes between build and cached steps.
+
+So the node instead sets `comfy.cli_args.args.disable_comfy_compiler = True` for the
+duration of a sampling run on its own model, restoring the previous value in a `finally`
+(including on error and interrupt). `model_prefetch` does `from comfy.cli_args import
+args`, holding the object by reference, so `malloc_graph_enabled()` observes the change
+immediately and `forward` skips `malloc_graph_begin/end` entirely. A user who passed
+`--disable-comfy-compiler` themselves is left untouched. This is a config value, not a
+monkeypatch, and it is scoped to the OUTER_SAMPLE wrapper on this model only.
+
 **Model wrapper.** A `WrappersMP.DIFFUSION_MODEL` wrapper runs around the whole forward.
 It decides, once per model call, whether this call is a frozen-video refinement step and
 what mode the blocks should run in. The block replacement itself is nearly stateless — it
@@ -239,9 +260,13 @@ All implement `put` / `get` / `begin_step` / `end_step` / `free`.
 
 - **`vram`** — tensors held on device. Fastest, but not tracked by ComfyUI's memory
   manager, so it competes with resident weights.
-- **`ram`** — pinned host memory for DMA without a staging copy. Falls back to pageable
-  memory with a warning if pinning fails, so RAM pressure degrades to swapping instead of
-  an OOM kill.
+- **`ram`** — pageable host memory. Pinned memory would transfer faster, but PyTorch's
+  pinned-host caching allocator never returns freed blocks to the OS, and blocks are only
+  reused for allocations of the same size — so rebuilding the cache at a different
+  resolution or clip length grows process RSS without bound (measured: ~88 GiB of
+  `RssShmem` and 375 `/dev/zero (deleted)` mappings across one session). The disk
+  backend's staging buffers are still pinned, but they are two fixed-size blocks, so the
+  retention is bounded.
 - **`disk`** — `np.lib.format.open_memmap` per tensor kind, with a double-buffered
   read-ahead thread staying one block ahead of the consumer. **Off unless `allow_disk` is
   set**, because it writes the entire cache on every build — gigabytes per run, and real
@@ -271,6 +296,10 @@ activated call -- torch's caching allocator makes that VRAM immediately reusable
 comfy's own allocations, and re-allocation next step from the same pool is near-free.
 `vram_margin_gb` is added to every request for clips where the estimate undershoots.
 
+`free_after_pass` attaches a second wrapper on `WrappersMP.OUTER_SAMPLE`, whose `finally`
+is an exact "sampling has ended" signal -- no inferring the end of a pass from step
+counts -- and frees every slot there. It fires on exceptions and interrupts too.
+
 Crucially the request and the `auto` fit test both include the *transient* peak of the
 step the cache coexists with, not just the packed cache. `comfy_kitchen`'s `int8_linear`
 allocates its output in fp32, so the MLP intermediate is `rows x ffn*2 x 4` -- about 8 GB
@@ -293,10 +322,13 @@ measurement, and it counts reclaimable page cache and slab. It is the right inpu
 pre-allocation decision and the wrong thing to compare against afterwards. Builds
 therefore log the estimate alongside the measured process RSS delta.
 
-Note that **pinned memory is not returned to the OS on free** — PyTorch's
-`CachingHostAllocator` retains freed pinned blocks for reuse (which is why
-`torch._C._host_emptyCache()` exists). RSS stays elevated after a free; the next build
-reuses those blocks. The free log says so explicitly.
+`RAM_OVERHEAD_FACTOR` (1.1) is the host footprint of the RAM cache relative to its packed
+size. Measured on the pageable store: 20.6 GB packed produced a 20.0 GB RSS delta and a
+19.4 GB `MemAvailable` delta — essentially no overhead, since the store is a handful of
+large contiguous tensors. It was 1.5 when the store was pinned and the caching host
+allocator retained blocks; carrying that value forward would have made `auto` ask for
+~11 GB more than a 20 GB cache needs. The build log prints `actual/estimated` next to the
+constant so it can be re-checked from any run rather than trusted.
 
 Sizes at 1344×768 / 124 frames (~38k rows, 50 blocks):
 

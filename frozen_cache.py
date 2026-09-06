@@ -467,7 +467,9 @@ class _Slot:
 
 class _State:
     def __init__(self, backend, precision, refresh_interval, contents="kv", verbose=False,
-                 allow_disk=False, vram_margin_gb=1.0):
+                 allow_disk=False, vram_margin_gb=1.0, free_after_pass=False):
+        self.free_after_pass = free_after_pass
+        self.activated_this_pass = False
         self.verbose = verbose
         self.allow_disk = allow_disk
         self.vram_margin = int(vram_margin_gb * (1 << 30))
@@ -527,11 +529,17 @@ def _fp_matches(a, b):
     return True
 
 
-# Measured on a real build: a 9.7 GB packed RAM cache cost ~14.9 GB of resident RSS.
-# Allocator slack, per-tensor pinning overhead (50 blocks x 4 tensors), and fragmentation
-# make the true host footprint ~1.5x the packed size. Used for both the auto-backend fit
-# test and the room we ask comfy to clear.
-RAM_OVERHEAD_FACTOR = 1.5
+# Host footprint of the RAM cache relative to its packed size, used for the auto-backend
+# fit test and the room we ask comfy to clear.
+#
+# Measured on a pageable cache (20.6 GB packed -> 20.0 GB RSS delta, 19.4 GB MemAvailable
+# delta): overhead is essentially nil, because the store is a handful of large contiguous
+# tensors. The 1.5x that lived here before was measured against the old *pinned*
+# implementation, where the caching host allocator retained blocks; that is gone (PR #1),
+# and 1.5x was over-asking by ~11 GB on a 20 GB cache -- enough to make `auto` refuse RAM
+# for caches that fit comfortably. 1.1 keeps a little slack for allocator rounding without
+# inventing headroom that is not needed.
+RAM_OVERHEAD_FACTOR = 1.1
 
 # comfy_kitchen's int8_linear allocates its output in fp32 (observed:
 # torch.empty((rows, ffn*2), dtype=out_dtype) asking 7.98 GiB at ~74.7k rows,
@@ -807,6 +815,14 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden, d_ffn2):
             if not activate:
                 return executor(x, timestep, context, transformer_options, **kwargs)
 
+            return _run_activated(executor, x, timestep, context,
+                                  transformer_options, kwargs, seg, layout)
+
+        finally:
+            state.mode = "off"
+
+    def _run_activated(executor, x, timestep, context, transformer_options, kwargs,
+                       seg, layout):
             state.aa, state.ab = seg["audio"]
             sig = getattr(layout, "signature", None)
             # NB: no data_ptr() here -- core allocates a fresh context tensor per call.
@@ -868,7 +884,7 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden, d_ffn2):
                          working_vram / 2**30)
                 if backend == "ram":
                     log.info("H3 Frozen Video Cache: expect ~%.1f GB host RAM resident for the "
-                             "%.1f GB packed cache (measured ~%.1fx allocator/pinning overhead)",
+                             "%.1f GB packed cache (%.2fx allocator overhead)",
                              total * RAM_OVERHEAD_FACTOR / 2**30, total / 2**30, RAM_OVERHEAD_FACTOR)
                 if backend == "disk":
                     log.warning("H3 Frozen Video Cache: writing %.1f GB to disk for this cache "
@@ -902,6 +918,7 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden, d_ffn2):
                                     "per-step free_memory() failed (%s); continuing." % e)
 
             state.slot = slot
+            state.activated_this_pass = True
             state.step_ctx = {"block_index": 0}
             try:
                 ret = executor(x, timestep, context, transformer_options, **kwargs)
@@ -927,10 +944,14 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden, d_ffn2):
                 avail_after = _meminfo_available_bytes()
                 d_rss = None if (rss_after is None or state.rss_before is None) else rss_after - state.rss_before
                 d_av = None if (avail_after is None or state.avail_before is None) else state.avail_before - avail_after
+                ratio = ""
+                if d_rss is not None and state.est_bytes:
+                    ratio = " | actual/estimated = %.2fx (RAM_OVERHEAD_FACTOR is %.2f)" % (
+                        d_rss / state.est_bytes, RAM_OVERHEAD_FACTOR)
                 log.info("H3 Frozen Video Cache: cache built | estimated %s | process RSS %s -> %s "
-                         "(+%s) | MemAvailable %s -> %s (-%s)",
+                         "(+%s) | MemAvailable %s -> %s (-%s)%s",
                          _gb(state.est_bytes), _gb(state.rss_before), _gb(rss_after), _gb(d_rss),
-                         _gb(state.avail_before), _gb(avail_after), _gb(d_av))
+                         _gb(state.avail_before), _gb(avail_after), _gb(d_av), ratio)
             if state.verbose:
                 _sync_if_cuda(x[0])
                 total = time.perf_counter() - t_call
@@ -946,9 +967,60 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden, d_ffn2):
                          state.mode, state.n_cached, state.n_built, state.n_stock, n_blocks,
                          state.t_blocks, total, total - state.t_blocks)
             return ret
-        finally:
-            state.mode = "off"
 
+    return wrapper
+
+
+def make_outer_sample_wrapper(state):
+    """Frees the cache when a sampling run ends, if free_after_pass is set.
+
+    OUTER_SAMPLE wraps the whole sampling call, so its `finally` is an exact
+    "the pass is over" signal -- no guessing from step counts. Runs on error and
+    on interrupt too, which is when releasing the memory matters most.
+    """
+    def wrapper(executor, *args, **kwargs):
+        state.activated_this_pass = False
+        # ComfyUI 0.34+ records the DiT forward into an aimdo "malloc graph" that
+        # assumes a repeatable allocation pattern. This node is the opposite of
+        # repeatable: the build step allocates gigabytes and evicts models
+        # mid-forward, cached steps allocate a different shape again. Pausing the
+        # recorder is not enough -- with nothing recorded between begin and end,
+        # malloc_graph_end's pop() itself fails. So switch the compiler off for
+        # the duration of sampling on this model, exactly what
+        # --disable-comfy-compiler does globally, and restore it afterwards.
+        cli = None
+        prev = None
+        try:
+            import comfy.cli_args as _cli_args
+            cli = _cli_args.args
+            prev = getattr(cli, "disable_comfy_compiler", None)
+            if prev is False:
+                cli.disable_comfy_compiler = True
+                if "compiler" not in state.warned:
+                    state.warned.add("compiler")
+                    log.info("H3 Frozen Video Cache: disabling the Comfy model compiler for "
+                             "this sampling run (the cache's allocations cannot be recorded "
+                             "into its malloc graph). Restored when the run ends.")
+        except Exception:
+            cli = None
+        try:
+            return executor(*args, **kwargs)
+        finally:
+            if cli is not None and prev is False:
+                try:
+                    cli.disable_comfy_compiler = prev
+                except Exception:
+                    pass
+            if state.free_after_pass and state.activated_this_pass:
+                freed = 0
+                for slot in list(state.slots.values()):
+                    if slot.store is not None:
+                        freed += 1
+                    slot.free()
+                state.slots.clear()
+                if freed:
+                    log.info("H3 Frozen Video Cache: pass finished, cache released "
+                             "(free_after_pass). The next run will rebuild it.")
     return wrapper
 
 
@@ -980,7 +1052,7 @@ def check_core_compat(dm):
 
 
 def patch_model(model, backend, precision, refresh_interval, cache_contents="kv", verbose=False,
-                allow_disk=False, enabled=True, vram_margin_gb=1.0):
+                allow_disk=False, enabled=True, vram_margin_gb=1.0, free_after_pass=False):
     if not enabled:
         # Return the model untouched: no wrapper, no block patches, no compat check.
         # Identical to bypassing the node, but keeps the graph wiring intact.
@@ -1003,10 +1075,13 @@ def patch_model(model, backend, precision, refresh_interval, cache_contents="kv"
 
     m = model.clone()
     state = _State(backend, precision, refresh_interval, cache_contents, verbose=verbose,
-                   allow_disk=allow_disk, vram_margin_gb=vram_margin_gb)
+                   allow_disk=allow_disk, vram_margin_gb=vram_margin_gb,
+                   free_after_pass=free_after_pass)
     replace = make_block_replace(state, lambda i: dm.blocks[i], n_blocks)
     for i in range(n_blocks):
         m.set_model_patch_replace(replace, "dit", "double_block", i)
     m.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
                            make_wrapper(state, n_blocks, d_kv, d_hidden, d_ffn2))
+    m.add_wrapper_with_key(WrappersMP.OUTER_SAMPLE, WRAPPER_KEY,
+                           make_outer_sample_wrapper(state))
     return m

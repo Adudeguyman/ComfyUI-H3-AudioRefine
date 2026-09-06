@@ -245,16 +245,25 @@ class H3FrozenVideoCache:
                                "this if you hit CUDA OOM during refinement -- it makes comfy "
                                "evict more weights before the cache and its working buffers "
                                "allocate."}),
+                "free_after_pass": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Release the cache as soon as the refinement pass ends, instead of "
+                               "keeping it for the next run. OFF keeps it resident so re-queueing "
+                               "the SAME pass-1 latent skips the rebuild -- but if you randomize "
+                               "seeds, the next run invalidates it anyway and you are holding "
+                               "several GB for nothing. Turn this ON if memory is tight; the cost "
+                               "is one full-price build step on every run."}),
             },
         }
 
     def patch(self, model, enabled, cache_contents, backend, precision, refresh_interval,
-              verbose=False, allow_disk=False, vram_margin_gb=1.0):
+              verbose=False, allow_disk=False, free_after_pass=False, vram_margin_gb=1.0):
         from . import frozen_cache
         return (frozen_cache.patch_model(model, backend, precision, refresh_interval,
                                          cache_contents=cache_contents, verbose=verbose,
                                          allow_disk=allow_disk, enabled=enabled,
-                                         vram_margin_gb=vram_margin_gb),)
+                                         vram_margin_gb=vram_margin_gb,
+                                         free_after_pass=free_after_pass),)
 
 
 NODE_CLASS_MAPPINGS = {
