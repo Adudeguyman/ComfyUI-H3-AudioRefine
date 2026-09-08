@@ -484,6 +484,7 @@ class _State:
         self.aa = self.ab = 0
         self.step_ctx = {}
         self.warned = set()
+        self.t_call = 0.0
         self.rss_before = None
         self.avail_before = None
         self.est_bytes = 0
@@ -793,7 +794,9 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden, d_ffn2):
         state.step_ctx = {}
         state.n_cached = state.n_built = state.n_stock = 0
         state.t_blocks = 0.0
-        t_call = time.perf_counter()
+        # On state, not a local: the verbose summary that reads this lives in
+        # _run_activated(), which is a sibling closure and cannot see wrapper()'s locals.
+        state.t_call = time.perf_counter()
         try:
             payload = kwargs.get("minimax_payload") or {}
             layout = payload.get("layout")
@@ -954,7 +957,7 @@ def make_wrapper(state, n_blocks, d_kv, d_hidden, d_ffn2):
                          _gb(state.avail_before), _gb(avail_after), _gb(d_av), ratio)
             if state.verbose:
                 _sync_if_cuda(x[0])
-                total = time.perf_counter() - t_call
+                total = time.perf_counter() - state.t_call
                 if state.n_cached + state.n_built + state.n_stock == 0:
                     log.warning("H3 Frozen Video Cache: the block replacement never ran this "
                                 "call (0 of %d blocks) -- this build of ComfyUI is not "

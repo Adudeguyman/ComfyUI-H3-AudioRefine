@@ -290,6 +290,12 @@ actually want rather than assuming `0`.
 
 ## Changelog
 
+**1.0.4**
+- Fix `NameError: name 't_call' is not defined` on every activated call with
+  `verbose` enabled (1.0.3 only). The per-call timestamp was a local of one closure
+  while the verbose summary that reads it lives in a sibling closure. Reported by
+  @sethharris-cpu (issue #2). `verbose=False` was unaffected.
+
 **1.0.3**
 - The RAM backend now keeps the cache in pageable host memory instead of pinned. Pinned
   blocks are retained by PyTorch's caching host allocator for the life of the process and
